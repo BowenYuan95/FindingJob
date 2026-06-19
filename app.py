@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+app.py — 求职匹配 + 申请追踪 Streamlit 面板
+
+两个视图:
+  📋 待投递   —— 匹配排序后的职位,可筛选/搜索/一键更新/改状态
+  📊 申请追踪 —— 所有非"待投"状态的职位,看状态/日期/备注,可编辑
+
+依赖:  pip install streamlit pandas
+运行:  streamlit run app.py
+"""
+
+import os
+import sqlite3
+import datetime as dt
+
+import pandas as pd
+import streamlit as st
+
+DB_PATH = "jobs.db"
+STATUSES = ["待投", "已投", "面试", "拒", "offer"]
+
+st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", layout="wide")
+
+
+# ----------------------------------------------------------------
+# 数据
+# ----------------------------------------------------------------
+
+@st.cache_data(ttl=60)
+def load_jobs():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT * FROM jobs", con)
+        con.close()
+    except Exception as e:
+        st.error(f"读取 {DB_PATH} 失败:{e}。先跑一次 job_matcher.py。")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    # 字段兜底(旧库未迁移)
+    for col, default in [("applied", 0), ("summary", ""), ("status", "待投"),
+                         ("applied_date", ""), ("note", "")]:
+        if col not in df.columns:
+            df[col] = default
+    df["status"] = df["status"].fillna("待投").replace("", "待投")
+    df["score"] = df.apply(
+        lambda r: r["llm_score"] if pd.notna(r["llm_score"]) else (r["sim"] or 0) * 100,
+        axis=1).round(0)
+    df["has_llm"] = df["llm_score"].notna()
+    return df.sort_values("score", ascending=False)
+
+
+def update_job(job_id, **fields):
+    """更新某职位的 status / note 等字段。"""
+    if not fields:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH)
+        sets = ", ".join(f"{k}=?" for k in fields)
+        con.execute(f"UPDATE jobs SET {sets} WHERE id=?",
+                    (*fields.values(), job_id))
+        con.commit(); con.close()
+        st.cache_data.clear()
+    except Exception as e:
+        st.error(f"更新失败:{e}")
+
+
+def set_status(job_id, status):
+    """改状态;非'待投'时记录日期、同步 applied 兼容字段。"""
+    today = dt.date.today().isoformat()
+    update_job(job_id, status=status,
+               applied=(0 if status == "待投" else 1),
+               applied_date=("" if status == "待投" else today))
+
+
+def lmstudio_alive():
+    import requests
+    base = os.environ.get("LMSTUDIO_BASE", "http://localhost:1234/v1")
+    try:
+        requests.get(f"{base}/models", timeout=3).raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def last_update_time():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT MAX(first_seen) FROM jobs").fetchone()
+        con.close()
+        return row[0] if row and row[0] else "—"
+    except Exception:
+        return "—"
+
+
+# ----------------------------------------------------------------
+# 侧栏:一键更新 + 视图切换
+# ----------------------------------------------------------------
+
+df = load_jobs()
+
+st.sidebar.title("🎯 求职面板")
+st.sidebar.caption(f"上次更新:{last_update_time()}")
+
+if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=True, type="primary"):
+    if not lmstudio_alive():
+        st.sidebar.error("LM Studio 没连上(localhost:1234)。先 Start Server 再更新。")
+    else:
+        before = len(df)
+        bar = st.sidebar.progress(0.0, text="准备中…")
+        try:
+            import importlib, job_matcher
+            importlib.reload(job_matcher)
+            # 进度回调:把 main 上报的 (frac, msg) 实时画到进度条
+            def on_progress(frac, msg):
+                bar.progress(min(max(frac, 0.0), 1.0), text=msg)
+            job_matcher.main(progress=on_progress)
+            st.cache_data.clear()
+        except Exception as e:
+            st.sidebar.error(f"运行失败:{e}")
+        else:
+            after = len(load_jobs())
+            bar.empty()
+            st.sidebar.success(f"完成!新增 {max(0, after - before)} 条")
+            st.rerun()
+
+st.sidebar.divider()
+view = st.sidebar.radio("视图", ["📋 待投递", "📊 申请追踪"], label_visibility="collapsed")
+
+if df.empty:
+    st.info("数据库还没数据。先在命令行跑 `python job_matcher.py`,再刷新。")
+    st.stop()
+
+
+# ================================================================
+# 视图一:待投递
+# ================================================================
+
+def render_todo():
+    sources = sorted(df["source"].dropna().unique().tolist())
+    pick_src   = st.sidebar.multiselect("来源", sources, default=sources)
+    min_score  = st.sidebar.slider("最低分数", 0, 100, 0, step=5)
+    kw         = st.sidebar.text_input("关键词(标题/公司)", "").strip().lower()
+    only_llm   = st.sidebar.checkbox("只看 LLM 复评过的", value=False)
+
+    v = df[(df["status"] == "待投") & df["source"].isin(pick_src) & (df["score"] >= min_score)]
+    if kw:
+        v = v[v["title"].str.lower().str.contains(kw, na=False) |
+              v["company"].str.lower().str.contains(kw, na=False)]
+    if only_llm:
+        v = v[v["has_llm"]]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("待投职位", len(v))
+    c2.metric("数据库总数", len(df))
+    c3.metric("平均分", f"{v['score'].mean():.0f}" if len(v) else "—")
+    st.divider()
+
+    if v.empty:
+        st.warning("当前筛选下没有待投职位。"); return
+
+    for _, r in v.iterrows():
+        tag = "🧠" if r["has_llm"] else "📐"
+        with st.container(border=True):
+            top = st.columns([0.8, 0.2])
+            top[0].markdown(f"### {r['title']}")
+            top[1].markdown(f"## `{int(r['score'])}` {tag}")
+            meta = " · ".join(str(x) for x in [r["company"], r["location"], r["salary"], r["source"]]
+                              if x and str(x).strip())
+            st.caption(meta)
+            if isinstance(r["llm_reason"], str) and r["llm_reason"].strip():
+                st.markdown(f"> {r['llm_reason']}")
+
+            bcol = st.columns([0.35, 0.4, 0.25])
+            if isinstance(r["url"], str) and r["url"].strip():
+                bcol[0].markdown(f"[🔗 查看职位]({r['url']})")
+            # 状态选择(选了非待投即进追踪表)
+            new_status = bcol[1].selectbox(
+                "状态", STATUSES, index=0, key=f"st_{r['id']}", label_visibility="collapsed")
+            if new_status != "待投":
+                set_status(r["id"], new_status); st.rerun()
+
+            summary = r.get("summary", "")
+            if isinstance(summary, str) and summary.strip():
+                with st.expander("📋 职位摘要(LLM 整理)"):
+                    st.markdown(summary)
+            elif isinstance(r["description"], str) and r["description"].strip():
+                with st.expander("职位描述"):
+                    st.write(r["description"][:1500])
+
+    st.caption("🧠 = Qwen 复评分 · 📐 = embedding 相似度分")
+
+
+# ================================================================
+# 视图二:申请追踪
+# ================================================================
+
+def render_tracker():
+    tracked = df[df["status"] != "待投"].copy()
+
+    # 顶部:各状态统计
+    cols = st.columns(len(STATUSES) - 1 + 1)
+    cols[0].metric("追踪总数", len(tracked))
+    for i, sname in enumerate([s for s in STATUSES if s != "待投"], 1):
+        cols[i].metric(sname, int((tracked["status"] == sname).sum()))
+    st.divider()
+
+    if tracked.empty:
+        st.info("还没有已处理的职位。去『待投递』里把投过的职位改个状态,就会出现在这里。")
+        return
+
+    # 状态筛选
+    pick = st.multiselect("筛选状态", [s for s in STATUSES if s != "待投"],
+                          default=[s for s in STATUSES if s != "待投"])
+    tracked = tracked[tracked["status"].isin(pick)]
+    tracked = tracked.sort_values("applied_date", ascending=False)
+
+    for _, r in tracked.iterrows():
+        with st.container(border=True):
+            head = st.columns([0.6, 0.4])
+            head[0].markdown(f"### {r['title']}")
+            badge = {"已投": "🟦", "面试": "🟨", "拒": "🟥", "offer": "🟩"}.get(r["status"], "")
+            head[1].markdown(f"### {badge} {r['status']}")
+            meta = " · ".join(str(x) for x in [r["company"], r["location"], r["source"]]
+                              if x and str(x).strip())
+            date = f" · 📅 {r['applied_date']}" if r["applied_date"] else ""
+            st.caption(meta + date)
+            if isinstance(r["url"], str) and r["url"].strip():
+                st.markdown(f"[🔗 查看职位]({r['url']})")
+
+            edit = st.columns([0.3, 0.7])
+            cur_idx = STATUSES.index(r["status"]) if r["status"] in STATUSES else 0
+            ns = edit[0].selectbox("状态", STATUSES, index=cur_idx,
+                                   key=f"tst_{r['id']}")
+            if ns != r["status"]:
+                set_status(r["id"], ns); st.rerun()
+            note = edit[1].text_input("备注", value=r.get("note", "") or "",
+                                      key=f"note_{r['id']}",
+                                      placeholder="面试时间、联系人、跟进事项…")
+            if note != (r.get("note", "") or ""):
+                update_job(r["id"], note=note); st.rerun()
+
+
+# ----------------------------------------------------------------
+if view == "📋 待投递":
+    render_todo()
+else:
+    render_tracker()

@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#secret files
+credentials.json 
+token.json 
+bowen95credentials

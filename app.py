@@ -18,7 +18,8 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "jobs.db"
+from config import DB_PATH, LMSTUDIO_BASE
+
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
 
 st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", layout="wide")
@@ -29,7 +30,7 @@ st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", l
 # ----------------------------------------------------------------
 
 @st.cache_data(ttl=60)
-def load_jobs():
+def load_jobs() -> pd.DataFrame:
     try:
         con = sqlite3.connect(DB_PATH)
         df = pd.read_sql_query("SELECT * FROM jobs", con)
@@ -52,7 +53,7 @@ def load_jobs():
     return df.sort_values("score", ascending=False)
 
 
-def update_job(job_id, **fields):
+def update_job(job_id: str, **fields: object) -> None:
     """更新某职位的 status / note 等字段。"""
     if not fields:
         return
@@ -67,7 +68,7 @@ def update_job(job_id, **fields):
         st.error(f"更新失败:{e}")
 
 
-def set_status(job_id, status):
+def set_status(job_id: str, status: str) -> None:
     """改状态;非'待投'时记录日期、同步 applied 兼容字段。"""
     today = dt.date.today().isoformat()
     update_job(job_id, status=status,
@@ -75,17 +76,41 @@ def set_status(job_id, status):
                applied_date=("" if status == "待投" else today))
 
 
-def lmstudio_alive():
+def lmstudio_alive() -> bool:
     import requests
-    base = os.environ.get("LMSTUDIO_BASE", "http://localhost:1234/v1")
     try:
-        requests.get(f"{base}/models", timeout=3).raise_for_status()
+        requests.get(f"{LMSTUDIO_BASE}/models", timeout=3).raise_for_status()
         return True
     except Exception:
         return False
 
 
-def last_update_time():
+def ensure_models_loaded():
+    """点更新前确保两个模型已加载(上轮可能被 backfill 卸载了)。"""
+    import subprocess
+    cmds = [
+        ["lms", "load", "text-embedding-nomic-embed-text-v1.5", "--gpu", "max"],
+        ["lms", "load", "qwen/qwen3.5-9b", "--gpu", "max", "--context-length", "16384"],
+    ]
+    for c in cmds:
+        try:
+            subprocess.run(c, shell=(os.name == "nt"), capture_output=True, timeout=120)
+        except Exception:
+            pass
+
+
+def trigger_backfill():
+    """后台启动 backfill:评完剩余 + 卸载模型(不阻塞面板)。"""
+    import subprocess
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        subprocess.Popen(["py", "backfill_scores.py"],
+                         creationflags=flags)
+    except Exception:
+        pass
+
+
+def last_update_time() -> str:
     try:
         con = sqlite3.connect(DB_PATH)
         row = con.execute("SELECT MAX(first_seen) FROM jobs").fetchone()
@@ -109,11 +134,11 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
         st.sidebar.error("LM Studio 没连上(localhost:1234)。先 Start Server 再更新。")
     else:
         before = len(df)
-        bar = st.sidebar.progress(0.0, text="准备中…")
+        bar = st.sidebar.progress(0.0, text="加载模型中…")
         try:
+            ensure_models_loaded()          # 确保模型在(上轮可能已卸载)
             import importlib, job_matcher
             importlib.reload(job_matcher)
-            # 进度回调:把 main 上报的 (frac, msg) 实时画到进度条
             def on_progress(frac, msg):
                 bar.progress(min(max(frac, 0.0), 1.0), text=msg)
             job_matcher.main(progress=on_progress)
@@ -123,7 +148,9 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
         else:
             after = len(load_jobs())
             bar.empty()
-            st.sidebar.success(f"完成!新增 {max(0, after - before)} 条")
+            trigger_backfill()              # 后台评剩余,评完自动卸载模型
+            st.sidebar.success(f"完成!新增 {max(0, after - before)} 条。"
+                               f"后台正在补评剩余,完成后会自动卸载模型。")
             st.rerun()
 
 st.sidebar.divider()
@@ -138,7 +165,7 @@ if df.empty:
 # 视图一:待投递
 # ================================================================
 
-def render_todo():
+def render_todo() -> None:
     sources = sorted(df["source"].dropna().unique().tolist())
     pick_src   = st.sidebar.multiselect("来源", sources, default=sources)
     min_score  = st.sidebar.slider("最低分数", 0, 100, 0, step=5)
@@ -197,7 +224,7 @@ def render_todo():
 # 视图二:申请追踪
 # ================================================================
 
-def render_tracker():
+def render_tracker() -> None:
     tracked = df[df["status"] != "待投"].copy()
 
     # 顶部:各状态统计

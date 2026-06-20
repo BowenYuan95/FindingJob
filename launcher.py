@@ -10,24 +10,27 @@ import os
 import sys
 import time
 import socket
+import logging
 import threading
 import subprocess
 
 import requests
 import webview
 
+logger = logging.getLogger(__name__)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8501
 URL  = f"http://localhost:{PORT}"
 
 
-def _port_open(port):
+def _port_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def start_streamlit():
+def start_streamlit() -> subprocess.Popen | None:
     if _port_open(PORT):
         return None
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -39,20 +42,19 @@ def start_streamlit():
         cwd=HERE, creationflags=flags)
 
 
-def start_backfill():
-    def _run():
+def start_backfill() -> None:
+    def _run() -> None:
         time.sleep(60)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            subprocess.Popen([sys.executable, "backfill_scores.py", "--watch",
-                              "--only-when-inactive", "--window-title", "JobFinder"],
+            subprocess.Popen([sys.executable, "backfill_scores.py", "--watch"],
                              cwd=HERE, creationflags=flags)
         except Exception as e:
-            print(f"[launcher] backfill failed: {e}")
+            logger.warning(f"[launcher] backfill failed: {e}")
     threading.Thread(target=_run, daemon=True).start()
 
 
-def wait_until_ready(timeout=60):
+def wait_until_ready(timeout: int = 60) -> bool:
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -63,9 +65,8 @@ def wait_until_ready(timeout=60):
     return False
 
 
-def main():
+def main() -> None:
     st_proc = start_streamlit()
-    start_backfill()
 
     if not wait_until_ready():
         import webbrowser

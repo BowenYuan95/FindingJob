@@ -18,6 +18,7 @@ import os
 import re
 import json
 import base64
+import logging
 from html.parser import HTMLParser
 
 import requests
@@ -25,6 +26,10 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+from config import LMSTUDIO_BASE, LLM_MODEL
+
+logger = logging.getLogger(__name__)
 
 # ---- Gmail ----
 SCOPES        = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -36,8 +41,6 @@ TOKEN_FILE    = "token.json"
 # ---- LLM 抽取(LM Studio)----
 USE_LLM_EXTRACT = True
 DEBUG_RAW       = False       # 调试:打印 LLM 原始返回
-LMSTUDIO_BASE   = os.environ.get("LMSTUDIO_BASE", "http://localhost:1234/v1")
-LLM_MODEL       = "qwen/qwen3.5-9b"     # 与 job_matcher.py 一致
 BODY_MAXLEN     = 10000                 # 压缩 URL 后的正文上限(更安全)
 
 
@@ -157,11 +160,11 @@ JSON array:"""
             txt = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
         finish = r.json()["choices"][0].get("finish_reason", "")
         if finish == "length":
-            print(f"[gmail]     ⚠ 输出被截断(finish_reason=length)")
+            logger.warning(f"[gmail]     ⚠ 输出被截断(finish_reason=length)")
         # 调试:打印原始返回的开头,看模型到底在写什么
         if DEBUG_RAW:
-            print(f"[gmail]     原始返回前300字: {txt[:300]!r}")
-            print(f"[gmail]     原始返回总长: {len(txt)} 字")
+            logger.info(f"[gmail]     原始返回前300字: {txt[:300]!r}")
+            logger.info(f"[gmail]     原始返回总长: {len(txt)} 字")
         arr = json.loads(_extract_json_array(txt))
         out = []
         for it in arr:
@@ -178,7 +181,7 @@ JSON array:"""
             })
         return out
     except Exception as e:
-        print(f"[gmail]   LLM 抽取失败({src}),退回正则: {e}")
+        logger.warning(f"[gmail]   LLM 抽取失败({src}),退回正则: {e}")
         return None
 
 def _regex_extract(body, src):
@@ -201,18 +204,18 @@ def fetch_gmail_alerts():
     try:
         svc = _get_service()
     except Exception as e:
-        print(f"[gmail] 初始化失败(检查 credentials.json): {e}")
+        logger.error(f"[gmail] 初始化失败(检查 credentials.json): {e}")
         return []
 
     query = f"label:{LABEL_NAME} newer_than:{MAX_DAYS_OLD}d"
     try:
         resp = svc.users().messages().list(userId="me", q=query, maxResults=100).execute()
     except Exception as e:
-        print(f"[gmail] 列邮件失败: {e}")
+        logger.warning(f"[gmail] 列邮件失败: {e}")
         return []
 
     msg_ids = resp.get("messages", [])
-    print(f"[gmail] 命中 {len(msg_ids)} 封 {LABEL_NAME} 邮件(近 {MAX_DAYS_OLD} 天)")
+    logger.info(f"[gmail] 命中 {len(msg_ids)} 封 {LABEL_NAME} 邮件(近 {MAX_DAYS_OLD} 天)")
 
     jobs = []
     for m in msg_ids:
@@ -224,7 +227,7 @@ def fetch_gmail_alerts():
                "linkedin" if "linkedin" in sender else "email")
         subject = headers.get("subject", "")[:60]
         body = _extract_body(msg["payload"])
-        print(f"[gmail]   · {src:8s} | 正文 {len(body)} 字 | {subject}")
+        logger.info(f"[gmail]   · {src:8s} | 正文 {len(body)} 字 | {subject}")
 
         parsed = None
         if USE_LLM_EXTRACT:
@@ -233,9 +236,9 @@ def fetch_gmail_alerts():
             parsed = _regex_extract(body, src)
 
         jobs.extend(parsed)
-        print(f"[gmail]   {src:8s} 解析出 {len(parsed)} 条")
+        logger.info(f"[gmail]   {src:8s} 解析出 {len(parsed)} 条")
 
-    print(f"[gmail] 合计解析 {len(jobs)} 条")
+    logger.info(f"[gmail] 合计解析 {len(jobs)} 条")
     return jobs
 
 

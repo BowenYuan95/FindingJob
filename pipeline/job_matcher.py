@@ -45,8 +45,8 @@ from .hard_filter import Flag, scan_disqualifiers, apply_flags
 try:
     from sources.gmail_alerts import fetch_gmail_alerts
 except Exception as _e:
-    def fetch_gmail_alerts() -> list[dict]:
-        logger.warning(f"[gmail] 模块未就绪,跳过: {_e}")
+    def fetch_gmail_alerts(_err: str = str(_e)) -> list[dict]:
+        logger.warning(f"[gmail] 模块未就绪,跳过: {_err}")
         return []
 
 logger = logging.getLogger(__name__)

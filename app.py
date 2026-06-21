@@ -118,6 +118,17 @@ def update_job(job_id: str, **fields: object) -> None:
         st.error(f"更新失败:{e}")
 
 
+def manually_disqualify(job_id: str) -> None:
+    try:
+        with database_session(DB_PATH) as con:
+            JobRepository(con).mark_manually_disqualified(
+                job_id, dt.datetime.now().isoformat(timespec="seconds")
+            )
+        st.cache_data.clear()
+    except Exception as e:
+        st.error(f"淘汰失败：{e}")
+
+
 def set_status(job_id: str, status: str) -> None:
     """改状态;首次离开待投时记录投递日期,后续状态变化保留该日期。"""
     today = dt.date.today().isoformat()
@@ -349,7 +360,7 @@ def render_todo() -> None:
                 cap = r.get("applied_cap")
                 st.caption(f"⚠ 系统封顶: {cap:.0f}" if pd.notna(cap) else "⚠ 系统封顶")
 
-            bcol = st.columns([0.35, 0.4, 0.25])
+            bcol = st.columns([0.3, 0.38, 0.15, 0.17])
             job_url = normalize_job_url(r.get("url"))
             if job_url:
                 if bcol[0].button("🔗 查看职位", key=f"url_{r['id']}"):
@@ -362,6 +373,8 @@ def render_todo() -> None:
                 "状态", STATUSES, index=0, key=f"st_{r['id']}", label_visibility="collapsed")
             if new_status != "待投":
                 set_status(r["id"], new_status); st.rerun()
+            if bcol[2].button("❌ 淘汰", key=f"dq_{r['id']}", help="手动标为不投"):
+                manually_disqualify(r["id"]); st.rerun()
 
             summary = r.get("summary", "")
             if isinstance(summary, str) and summary.strip():

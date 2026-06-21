@@ -96,6 +96,19 @@ class JobRepository:
             WHERE id=?
         """, (reason, flags_json, now, job_id))
 
+    def mark_manually_disqualified(self, job_id: str, now: str) -> None:
+        self.con.execute("""
+            UPDATE jobs
+            SET status='DISQUALIFIED',
+                llm_score=COALESCE(llm_score, 5),
+                applied_cap=COALESCE(applied_cap, 5),
+                llm_reason='用户手动淘汰',
+                pipeline_state='DISQUALIFIED',
+                score_status='DISQUALIFIED',
+                updated_at=?
+            WHERE id=?
+        """, (now, job_id))
+
     def last_seen(self) -> str:
         row = self.con.execute("SELECT MAX(first_seen) FROM jobs").fetchone()
         return row[0] if row and row[0] else ""

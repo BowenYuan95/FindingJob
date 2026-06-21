@@ -22,12 +22,13 @@ rescore_stale.py — 把"用旧 rubric/prompt 评过"的岗清回 NULL,交给 ba
 import sys
 import sqlite3
 
-import job_matcher as jm   # 复用 DB_PATH
+from config import DB_PATH
+from infrastructure.database import initialize_database
 
 
 def main():
     apply = "--apply" in sys.argv
-    con = sqlite3.connect(jm.DB_PATH)
+    con = initialize_database(DB_PATH)
 
     total       = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     disq        = con.execute(
@@ -51,7 +52,9 @@ def main():
         return
 
     n = con.execute("""
-        UPDATE jobs SET llm_score=NULL
+        UPDATE jobs
+        SET llm_score=NULL, pipeline_state='READY_FOR_LLM',
+            last_error='', score_attempts=0
         WHERE llm_score IS NOT NULL AND status != 'DISQUALIFIED'
     """).rowcount
     con.commit()

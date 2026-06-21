@@ -17,6 +17,7 @@ job_matcher.py — 个人求职聚合 + 本地匹配排序工具(宽搜窄评版
 """
 
 import re
+import os
 import json
 import time
 import sqlite3
@@ -29,9 +30,10 @@ import requests
 import numpy as np
 from numpy.typing import NDArray
 
+from infrastructure.database import initialize_database
+
 from config import (
-    ADZUNA_APP_ID, ADZUNA_APP_KEY, ADZUNA_COUNTRY, ADZUNA_PAGES,
-    WHAT_EXCLUDE, MAX_DAYS_OLD, SEARCHES,
+    ADZUNA_APP_ID, ADZUNA_APP_KEY,
     LMSTUDIO_BASE, EMBED_MODEL, LLM_MODEL,
     USE_EMBEDDING, USE_LLM_SCORING, TOP_N_FOR_LLM, SCORE_THRESHOLD,
     PROFILE, SENIOR_TERMS, JUNIOR_TERMS, SENIOR_PENALTY, JUNIOR_BONUS,
@@ -42,9 +44,11 @@ from config import (
 from .hard_filter import Flag, scan_disqualifiers, apply_flags
 
 # Gmail 解析模块(OAuth + LLM 抽取),见 sources/gmail_alerts.py
+GMAIL_IMPORT_ERROR: str | None = None
 try:
     from sources.gmail_alerts import fetch_gmail_alerts
 except Exception as _e:
+    GMAIL_IMPORT_ERROR = str(_e)
     def fetch_gmail_alerts(_err: str = str(_e)) -> list[dict]:
         logger.warning(f"[gmail] 模块未就绪,跳过: {_err}")
         return []
@@ -57,111 +61,99 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def db_init() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS jobs(
-            id TEXT PRIMARY KEY,
-            title TEXT, company TEXT, location TEXT,
-            description TEXT, url TEXT, source TEXT,
-            salary TEXT, created TEXT,
-            sim REAL, llm_score REAL, llm_reason TEXT,
-            first_seen TEXT,
-            applied INTEGER DEFAULT 0,
-            summary TEXT DEFAULT '',
-            status TEXT DEFAULT '待投',
-            applied_date TEXT DEFAULT '',
-            note TEXT DEFAULT '',
-            flags TEXT DEFAULT ''
-        )""")
-    # 旧库自动迁移:缺列就补
-    cols = [r[1] for r in con.execute("PRAGMA table_info(jobs)").fetchall()]
-    for col, ddl in [
-        ("applied",      "applied INTEGER DEFAULT 0"),
-        ("summary",      "summary TEXT DEFAULT ''"),
-        ("status",       "status TEXT DEFAULT '待投'"),
-        ("applied_date", "applied_date TEXT DEFAULT ''"),
-        ("note",         "note TEXT DEFAULT ''"),
-        ("flags",        "flags TEXT DEFAULT ''"),   # === [接线 2/3] 新增 flags 列 ===
-    ]:
-        if col not in cols:
-            con.execute(f"ALTER TABLE jobs ADD COLUMN {ddl}")
-    con.commit()
-    return con
+    return initialize_database(DB_PATH)
 
 
-def job_hash(title: str, company: str) -> str:
-    raw = f"{title}|{company}".lower().strip()
+def job_hash(
+    title: str, company: str, source: str = "", source_id: str = "",
+) -> str:
+    if source and source_id:
+        raw = f"{source}|{source_id}".lower().strip()
+    else:
+        raw = f"{title}|{company}".lower().strip()
     raw = re.sub(r"\s+", " ", raw)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _semantic_key(job: dict) -> tuple[str, str, str]:
+    return tuple(
+        re.sub(r"\s+", " ", str(job.get(field, "") or "").strip().lower())
+        for field in ("title", "company", "location")
+    )
+
+
+def find_existing_job(con: sqlite3.Connection, job: dict) -> str | None:
+    """Find native-ID or legacy title/company records without duplicating old DB rows."""
+    source = str(job.get("source") or "")
+    source_id = str(job.get("source_id") or "")
+    if source and source_id:
+        row = con.execute(
+            "SELECT id FROM jobs WHERE source=? AND source_id=?",
+            (source, source_id),
+        ).fetchone()
+        if row:
+            return row[0]
+
+        # One-time compatibility bridge for rows created before source_id existed.
+        legacy_id = job_hash(job.get("title", ""), job.get("company", ""))
+        row = con.execute(
+            "SELECT id FROM jobs WHERE id=? AND source=? AND COALESCE(source_id,'')=''",
+            (legacy_id, source),
+        ).fetchone()
+        if row:
+            con.execute("UPDATE jobs SET source_id=? WHERE id=?", (source_id, row[0]))
+            return row[0]
+
+    jid = job_hash(job.get("title", ""), job.get("company", ""), source, source_id)
+    row = con.execute("SELECT id FROM jobs WHERE id=?", (jid,)).fetchone()
+    return row[0] if row else None
 
 
 # ============================================================
 # 3. 采集:Adzuna
 # ============================================================
 
-def _get_with_retry(url: str, params: dict, tries: int = 4, base_wait: int = 2) -> requests.Response:
-    last = None
-    for attempt in range(1, tries + 1):
+ADZUNA_IMPORT_ERROR: str | None = None
+try:
+    from sources.adzuna_search import fetch_adzuna
+except Exception as _e:
+    ADZUNA_IMPORT_ERROR = str(_e)
+    fetch_adzuna = None
+
+
+def validate_runtime() -> tuple[list[str], list[str]]:
+    """Return (blocking errors, non-blocking warnings) before starting the pipeline."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if ADZUNA_IMPORT_ERROR or not callable(fetch_adzuna):
+        errors.append(f"Adzuna 模块未就绪: {ADZUNA_IMPORT_ERROR or '不可调用'}")
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+        errors.append("缺少 ADZUNA_APP_ID / ADZUNA_APP_KEY")
+    if GMAIL_IMPORT_ERROR:
+        warnings.append(f"Gmail 模块未就绪,本轮将跳过: {GMAIL_IMPORT_ERROR}")
+
+    db_parent = os.path.dirname(os.path.abspath(DB_PATH)) or os.getcwd()
+    if not os.path.isdir(db_parent) or not os.access(db_parent, os.W_OK):
+        errors.append(f"数据库目录不可写: {db_parent}")
+
+    required_models = set()
+    if USE_EMBEDDING:
+        required_models.add(EMBED_MODEL)
+    if USE_LLM_SCORING:
+        required_models.add(LLM_MODEL)
+    if required_models:
         try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 503:
-                raise requests.HTTPError("503", response=r)
-            r.raise_for_status()
-            return r
+            response = requests.get(f"{LMSTUDIO_BASE}/models", timeout=5)
+            response.raise_for_status()
+            loaded = {item.get("id") for item in response.json().get("data", [])}
+            missing = sorted(required_models - loaded)
+            if missing:
+                errors.append("LM Studio 模型未加载: " + ", ".join(missing))
         except Exception as e:
-            last = e
-            if attempt < tries:
-                wait = base_wait * attempt
-                logger.warning(f"[adzuna] 第 {attempt} 次失败({e}),{wait}s 后重试…")
-                time.sleep(wait)
-    raise last
+            errors.append(f"LM Studio 未就绪({LMSTUDIO_BASE}): {e}")
 
-
-def fetch_adzuna() -> list[dict]:
-    jobs = []
-    for s in SEARCHES:
-        for page in range(1, ADZUNA_PAGES + 1):
-            url = f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/{page}"
-            params = {
-                "app_id": ADZUNA_APP_ID,
-                "app_key": ADZUNA_APP_KEY,
-                "results_per_page": 50,
-                "max_days_old": MAX_DAYS_OLD,
-                "sort_by": "date",
-                "content-type": "application/json",
-            }
-            if WHAT_EXCLUDE:
-                params["what_exclude"] = WHAT_EXCLUDE
-            params.update(s)
-            try:
-                r = _get_with_retry(url, params)
-                data = r.json()
-            except Exception as e:
-                logger.warning(f"[adzuna] 查询失败(已重试) {s} p{page}: {e}")
-                break
-            results = data.get("results", [])
-            if not results:
-                break
-            for j in results:
-                jobs.append({
-                    "title":       j.get("title", "").strip(),
-                    "company":     (j.get("company") or {}).get("display_name", ""),
-                    "location":    (j.get("location") or {}).get("display_name", ""),
-                    "description": re.sub(r"\s+", " ", j.get("description", "")),
-                    "url":         j.get("redirect_url", ""),
-                    "source":      "adzuna",
-                    "salary":      _fmt_salary(j),
-                    "created":     j.get("created", ""),
-                })
-    logger.info(f"[adzuna] 抓到 {len(jobs)} 条")
-    return jobs
-
-
-def _fmt_salary(j: dict) -> str:
-    lo, hi = j.get("salary_min"), j.get("salary_max")
-    if lo and hi:
-        return f"${int(lo):,}-${int(hi):,}"
-    return ""
+    return errors, warnings
 
 
 # ============================================================
@@ -169,11 +161,25 @@ def _fmt_salary(j: dict) -> str:
 # ============================================================
 
 def embed_batch(texts: list[str]) -> list[NDArray[np.float32]]:
-    r = requests.post(f"{LMSTUDIO_BASE}/embeddings",
-                      json={"model": EMBED_MODEL, "input": [t[:6000] for t in texts]},
-                      timeout=120)
-    r.raise_for_status()
-    return [np.array(d["embedding"], dtype=np.float32) for d in r.json()["data"]]
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                f"{LMSTUDIO_BASE}/embeddings",
+                json={"model": EMBED_MODEL, "input": [t[:6000] for t in texts]},
+                timeout=120,
+            )
+            r.raise_for_status()
+            data = r.json()["data"]
+            if len(data) != len(texts):
+                raise ValueError(f"embedding count mismatch: {len(data)} != {len(texts)}")
+            return [np.array(d["embedding"], dtype=np.float32) for d in data]
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[embed] 第 {attempt}/3 次调用失败: {e}")
+            if attempt < 3:
+                time.sleep(2 ** (attempt - 1))
+    raise RuntimeError(f"embedding 调用连续失败: {last_error}")
 
 
 def cosine(a: NDArray[np.float32], b: NDArray[np.float32]) -> float:
@@ -237,7 +243,7 @@ def llm_review(
 3. 资历/阶段契合(20)—— 对早期职业者是否友好(学术与产业同等对待):
    学术侧 Level A / Level B / postdoc / 接受应届博士;产业侧 graduate / junior /
    associate / 1-3 年 / early-career R&D。命中任一侧早期信号 16-20;
-   未明确但不排斥 10-15;偏资深但未硬卡 4-9。
+   未明确但不排斥 10-15;偏资深但未硬卡或博士奖学金项目：4-9。
 4. 地点/工作方式(10)。
 5. 加成(5)—— 发表文化 / XR-HCI-AI 实验室 / 明确导师 / 博士友好。
 【打分纪律】诚实桥接:转移性技能算分但打折,相邻可桥接不得抬到 85+;拿不准往低打。
@@ -272,50 +278,64 @@ def llm_review(
   "discipline": {{"core_discipline": "<具体学科名>", "discipline_class": "in_domain|adjacent|out_of_domain",
                   "discipline_multiplier": 1.0, "discipline_reason": "<≤30字中文>"}}}}
 """
-    try:
-        r = requests.post(f"{LMSTUDIO_BASE}/chat/completions",
-                          json={"model": LLM_MODEL,
-                                "messages": [{"role": "system", "content": sys},
-                                             {"role": "user", "content": prompt}],
-                                "temperature": 0.2,
-                                "stream": False},
-                          timeout=240)
-        r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"]
-        obj = json.loads(_extract_json(txt))
-        sm = obj.get("summary", "")
-        if isinstance(sm, list):
-            sm = "\n".join(f"- {str(x).strip()}" for x in sm if str(x).strip())
-        else:
-            sm = str(sm)
-        raw_score = obj.get("score", 0)
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
         try:
-            score = float(str(raw_score).split("/")[0].strip())
-        except Exception:
-            score = 0.0
-        llm_flags = obj.get("flags", []) or []
-        if not isinstance(llm_flags, list):
-            llm_flags = []
+            r = requests.post(f"{LMSTUDIO_BASE}/chat/completions",
+                              json={"model": LLM_MODEL,
+                                    "messages": [{"role": "system", "content": sys},
+                                                 {"role": "user", "content": prompt}],
+                                    "temperature": 0.2,
+                                    "stream": False},
+                              timeout=240)
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            txt = msg.get("content") or msg.get("reasoning_content") or ""
+            obj = json.loads(_extract_json(txt))
+            sm = obj.get("summary", "")
+            if isinstance(sm, list):
+                sm = "\n".join(f"- {str(x).strip()}" for x in sm if str(x).strip())
+            else:
+                sm = str(sm)
 
-        # Discipline multiplier — LLM classifies, Python applies (CLAUDE.md red line)
-        disc      = obj.get("discipline") or {}
-        disc_cls  = disc.get("discipline_class", "in_domain")
-        disc_mult = disc.get("discipline_multiplier", 1.0)
-        if disc_mult not in (1.0, 0.8, 0.5):   # clamp to legal values
-            disc_mult = 1.0
-        disc_reason = disc.get("discipline_reason", "")
-        if disc_mult < 1.0 and score is not None:
+            raw_score = obj.get("score")
+            if raw_score is None:
+                raise ValueError("response missing score")
+            score = float(str(raw_score).split("/")[0].strip())
+            if not 0 <= score <= 100:
+                raise ValueError(f"score out of range: {score}")
+
+            llm_flags = obj.get("flags", []) or []
+            if not isinstance(llm_flags, list):
+                raise ValueError("flags must be an array")
+
+            # LLM only classifies. Python owns the class -> multiplier mapping.
+            disc = obj.get("discipline") or {}
+            disc_cls = disc.get("discipline_class")
+            disc_multipliers = {
+                "in_domain": 1.0,
+                "adjacent": 0.8,
+                "out_of_domain": 0.5,
+            }
+            if disc_cls not in disc_multipliers:
+                raise ValueError(f"invalid discipline_class: {disc_cls!r}")
+            disc_mult = disc_multipliers[disc_cls]
+            disc_reason = disc.get("discipline_reason", "")
             score = round(score * disc_mult)
-        disc_flag: Flag = {
-            "code": "discipline",
-            "label": f"学科:{disc_cls}×{disc_mult}",
-            "cap": 100,
-            "severity": "warn",
-            "evidence": disc_reason or f"({disc_cls})",
-        }
-        return score, str(obj.get("reason", "")), sm, llm_flags + [disc_flag]
-    except Exception as e:
-        return None, f"(LLM 打分失败: {e})", "", []
+            disc_flag: Flag = {
+                "code": "discipline",
+                "label": f"学科:{disc_cls}×{disc_mult}",
+                "cap": 100,
+                "severity": "warn",
+                "evidence": disc_reason or f"({disc_cls})",
+            }
+            return score, str(obj.get("reason", "")), sm, llm_flags + [disc_flag]
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[llm] 第 {attempt}/3 次调用失败: {e}")
+            if attempt < 3:
+                time.sleep(2 ** (attempt - 1))
+    return None, f"(LLM 打分失败,已重试 3 次: {last_error})", "", []
 
 
 def llm_flags_to_objs(codes: list) -> list[Flag]:
@@ -343,27 +363,51 @@ def main(progress: Any = None) -> None:
             try: progress(frac, msg)
             except Exception: pass
 
+    errors, warnings = validate_runtime()
+    for warning in warnings:
+        logger.warning(f"[ready] {warning}")
+    if errors:
+        raise RuntimeError("运行环境未就绪:\n- " + "\n- ".join(errors))
+
     con = db_init()
     _p(0.05, "正在抓取 Adzuna + Gmail...")
     raw_jobs = fetch_adzuna() + fetch_gmail_alerts()
 
-    # 去重
+    # 去重:Adzuna 优先 native source_id;无 native ID 的来源回退 title+company。
     new_jobs = []
-    seen = set()
+    seen_ids: set[str] = set()
+    seen_semantic: set[tuple[str, str, str]] = set()
     for j in raw_jobs:
         if not j["title"]:
             continue
-        jid = job_hash(j["title"], j["company"])
-        if jid in seen:
+        source = str(j.get("source") or "")
+        source_id = str(j.get("source_id") or "")
+        jid = job_hash(j["title"], j["company"], source, source_id)
+        semantic = _semantic_key(j)
+        if jid in seen_ids or (not source_id and semantic in seen_semantic):
             continue
-        if con.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)).fetchone():
-            continue
-        seen.add(jid)
+        existing_id = find_existing_job(con, j)
+        if existing_id:
+            state_row = con.execute(
+                "SELECT pipeline_state FROM jobs WHERE id=?", (existing_id,)
+            ).fetchone()
+            # Transient embedding failures are eligible for a later ingestion retry.
+            if not state_row or state_row[0] != "EMBEDDING_FAILED":
+                continue
+            jid = existing_id
+        seen_ids.add(jid)
+        if not source_id:
+            seen_semantic.add(semantic)
         j["id"] = jid
         new_jobs.append(j)
     _p(0.12, f"去重后新职位 {len(new_jobs)} 条")
     if not new_jobs:
-        logger.info("没有新职位。"); return
+        logger.info("没有新职位。")
+        con.commit()  # persist legacy source_id bridges created during dedup
+        con.close()
+        return
+
+    ingested_jobs = list(new_jobs)
 
     # === [接线 3/3] 确定性硬筛:去重之后、embedding 之前 ===
     # knockout 的不浪费 embedding/LLM 算力,直接定分;非 knockout 的挂上 flags 往下走。
@@ -372,10 +416,14 @@ def main(progress: Any = None) -> None:
         j["flags"] = scan_disqualifiers(j["title"], j["description"])
         j["sim"] = j["sim_raw"] = 0.0
         j["llm_score"], j["llm_reason"], j["summary"] = None, "", ""
+        j["pipeline_state"], j["score_attempts"], j["last_error"] = "INGESTED", 0, ""
         if any(f["severity"] == "knockout" for f in j["flags"]):
-            j["llm_score"], _ = apply_flags(0, j["flags"])   # = 5
+            # Knockout uses a visible sentinel score of 5. min(base, cap) with
+            # base=0 would incorrectly store 0 instead.
+            j["llm_score"], _ = apply_flags(5, j["flags"])
             j["llm_reason"] = "硬性淘汰:" + ";".join(
                 f["label"] for f in j["flags"] if f["severity"] == "knockout")
+            j["pipeline_state"] = "DISQUALIFIED"
             knocked.append(j)
         else:
             gated.append(j)
@@ -384,30 +432,50 @@ def main(progress: Any = None) -> None:
 
     # embedding 初筛(可关)
     if USE_EMBEDDING and new_jobs:
-        pvec = embed_batch([PROFILE])[0]
-        dim = len(pvec)
-        texts = [f"{j['title']} at {j['company']}. {j['description']}" for j in new_jobs]
-        BATCH = 32
-        vecs = []
-        for i in range(0, len(texts), BATCH):
-            chunk = texts[i:i+BATCH]
-            try:
-                vecs.extend(embed_batch(chunk))
-            except Exception as e:
-                logger.warning(f"[embed] 批次 {i} 失败: {e}")
-                vecs.extend([np.zeros(dim, dtype=np.float32)] * len(chunk))
-            done = min(i + BATCH, len(texts))
-            _p(0.15 + 0.45 * done / len(texts), f"嵌入匹配 {done}/{len(texts)}")
-        for j, v in zip(new_jobs, vecs):
-            raw = cosine(pvec, v)
-            j["sim_raw"] = raw
-            j["sim"] = seniority_adjust(raw, j["title"])
-        new_jobs = [j for j in new_jobs if j["sim"] >= SCORE_THRESHOLD]
+        try:
+            pvec = embed_batch([PROFILE])[0]
+            texts = [f"{j['title']} at {j['company']}. {j['description']}" for j in new_jobs]
+            BATCH = 32
+            results: list[tuple[NDArray[np.float32] | None, str]] = []
+            for i in range(0, len(texts), BATCH):
+                chunk = texts[i:i+BATCH]
+                try:
+                    results.extend((vector, "") for vector in embed_batch(chunk))
+                except Exception as e:
+                    error = str(e)
+                    logger.warning(f"[embed] 批次 {i} 失败: {error}")
+                    results.extend((None, error) for _ in chunk)
+                done = min(i + BATCH, len(texts))
+                _p(0.15 + 0.45 * done / len(texts), f"嵌入匹配 {done}/{len(texts)}")
+
+            accepted = []
+            for j, (vector, error) in zip(new_jobs, results):
+                if vector is None:
+                    j["pipeline_state"] = "EMBEDDING_FAILED"
+                    j["last_error"] = error
+                    continue
+                raw = cosine(pvec, vector)
+                j["sim_raw"] = raw
+                j["sim"] = seniority_adjust(raw, j["title"])
+                if j["sim"] >= SCORE_THRESHOLD:
+                    j["pipeline_state"] = "READY_FOR_LLM"
+                    accepted.append(j)
+                else:
+                    j["pipeline_state"] = "EMBEDDING_REJECTED"
+            new_jobs = accepted
+        except Exception as e:
+            error = str(e)
+            logger.warning(f"[embed] 画像 embedding 失败,本轮全部延后: {error}")
+            for j in new_jobs:
+                j["pipeline_state"] = "EMBEDDING_FAILED"
+                j["last_error"] = error
+            new_jobs = []
         new_jobs.sort(key=lambda x: x["sim"], reverse=True)
         logger.info(f"[embed] 过阈值({SCORE_THRESHOLD}) {len(new_jobs)} 条")
     elif not USE_EMBEDDING:
         for j in new_jobs:
             j["sim"] = 0.0
+            j["pipeline_state"] = "READY_FOR_LLM"
         logger.info(f"[skip-embed] 跳过 embedding,保留全部 {len(new_jobs)} 条")
 
     # LLM 复评(只评 top-N);评完用 flags 统一封顶
@@ -422,37 +490,55 @@ def main(progress: Any = None) -> None:
                 if st != "ok":
                     reason = f"[{st}] " + reason
             j["llm_score"], j["llm_reason"], j["summary"] = score, reason, summary
+            j["score_attempts"] += 1
+            if score is None:
+                j["pipeline_state"] = "READY_FOR_LLM"
+                j["last_error"] = reason
+            elif any(f["severity"] == "knockout" for f in j["flags"]):
+                j["pipeline_state"] = "DISQUALIFIED"
+            else:
+                j["pipeline_state"] = "SCORED"
             logger.info(f"[llm] 复评 {idx}/{n}: {j['title'][:40]} -> {j['llm_score']}")
             _p(0.6 + 0.35 * idx / n, f"LLM 复评 {idx}/{n}: {j['title'][:30]}")
         new_jobs.sort(
             key=lambda x: x["llm_score"] if x["llm_score"] is not None else x["sim"] * 100,
             reverse=True)
 
-    # 落库 + digest(knockout 那批也一并入库,便于去重与审计)
+    # 所有采集结果都落库;pipeline_state 记录被淘汰、拒绝或等待评分的原因。
     now = dt.datetime.now().isoformat(timespec="seconds")
-    all_jobs = new_jobs + knocked
+    all_jobs = ingested_jobs
     for j in all_jobs:
         st = "DISQUALIFIED" if any(
             f["severity"] == "knockout" for f in (j.get("flags") or [])) else "待投"
-        con.execute("""INSERT OR REPLACE INTO jobs
-            (id,title,company,location,description,url,source,salary,created,
+        con.execute("""INSERT INTO jobs
+            (id,title,company,location,description,url,source,source_id,salary,created,
              sim,llm_score,llm_reason,first_seen,summary,flags,
+             pipeline_state,score_attempts,last_error,updated_at,
              applied,status,applied_date,note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                    COALESCE((SELECT applied      FROM jobs WHERE id=?),0),
-                    COALESCE((SELECT status       FROM jobs WHERE id=?),?),
-                    COALESCE((SELECT applied_date FROM jobs WHERE id=?),''),
-                    COALESCE((SELECT note         FROM jobs WHERE id=?),''))""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              title=excluded.title, company=excluded.company, location=excluded.location,
+              description=excluded.description, url=excluded.url, source=excluded.source,
+              source_id=excluded.source_id, salary=excluded.salary, created=excluded.created,
+              sim=excluded.sim, llm_score=excluded.llm_score,
+              llm_reason=excluded.llm_reason, summary=excluded.summary, flags=excluded.flags,
+              pipeline_state=excluded.pipeline_state,
+              score_attempts=jobs.score_attempts + excluded.score_attempts,
+              last_error=excluded.last_error, updated_at=excluded.updated_at,
+              status=CASE WHEN excluded.status='DISQUALIFIED'
+                          THEN 'DISQUALIFIED' ELSE jobs.status END""",
             (j["id"], j["title"], j["company"], j["location"], j["description"],
-             j["url"], j["source"], j["salary"], j["created"],
+             j["url"], j["source"], j.get("source_id", ""), j["salary"], j["created"],
              j["sim"], j["llm_score"], j["llm_reason"], now,
              j.get("summary", ""),
              json.dumps(j.get("flags", []), ensure_ascii=False),
-             j["id"], j["id"], st, j["id"], j["id"]))
+             j.get("pipeline_state", "INGESTED"), j.get("score_attempts", 0),
+             j.get("last_error", ""), now, 0, st, "", ""))
     con.commit()
+    con.close()
     write_digest(new_jobs)
-    logger.info(f"[done] 入库 {len(all_jobs)} 条(其中硬淘汰 {len(knocked)}) -> {DIGEST_PATH}")
-    _p(1.0, f"完成!打分 {len(new_jobs)} 条,硬淘汰 {len(knocked)} 条")
+    logger.info(f"[done] 入库 {len(all_jobs)} 条(可评分 {len(new_jobs)},硬淘汰 {len(knocked)}) -> {DIGEST_PATH}")
+    _p(1.0, f"完成!采集入库 {len(all_jobs)} 条,可评分 {len(new_jobs)},硬淘汰 {len(knocked)} 条")
 
 
 def write_digest(jobs: list[dict]) -> None:

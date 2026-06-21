@@ -27,6 +27,7 @@ import logging
 from collections import Counter
 
 from config import DB_PATH
+from infrastructure.database import initialize_database
 from pipeline.hard_filter import scan_disqualifiers, apply_flags, dedup_flags
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,12 @@ def plan_row(
     except Exception:
         old_flags = []
 
-    # 保留 LLM 来源 flag,只刷新正则部分
-    llm_origin = [f for f in old_flags if str(f.get("label", "")).startswith("LLM:")]
+    # 保留 LLM 来源 flag,包括由 llm_review 构造的 discipline 结构化项。
+    llm_origin = [
+        f for f in old_flags
+        if str(f.get("label", "")).startswith("LLM:")
+        or f.get("code") == "discipline"
+    ]
     new_regex  = scan_disqualifiers(title or "", description or "")
     merged     = dedup_flags(new_regex + llm_origin)
 
@@ -55,6 +60,9 @@ def plan_row(
     changed = codes_of(old_flags) != codes_of(merged)
 
     if not changed:
+        if has_ko:
+            action = "knockout" if llm_score != 5 or status != "DISQUALIFIED" else "unchanged"
+            return merged, 5, "DISQUALIFIED", action
         # flag 集没变:重写 flags(cap 可能微调),分按现有终值收紧(幂等)
         if llm_score is not None and merged:
             new_score, _ = apply_flags(llm_score, merged)
@@ -72,7 +80,7 @@ def plan_row(
 
 def main():
     apply = "--apply" in sys.argv
-    con = sqlite3.connect(DB_PATH)
+    con = initialize_database(DB_PATH)
     rows = con.execute(
         "SELECT id, title, company, description, flags, llm_score, status "
         "FROM jobs").fetchall()
@@ -88,7 +96,12 @@ def main():
         # 只有真正发生变化的才需要写
         new_fl_json = json.dumps(new_flags, ensure_ascii=False)
         if (new_fl_json != (fl or "[]")) or (new_score != sc) or (new_status != st):
-            writes.append((new_fl_json, new_score, new_status, jid))
+            pipeline_state = (
+                "DISQUALIFIED" if new_status == "DISQUALIFIED"
+                else "READY_FOR_LLM" if new_score is None
+                else "SCORED"
+            )
+            writes.append((new_fl_json, new_score, new_status, pipeline_state, jid))
             if action in examples and len(examples[action]) < 8:
                 examples[action].append(f"{(title or '')[:42]} | {company or ''}")
 
@@ -111,7 +124,9 @@ def main():
         return
 
     con.executemany(
-        "UPDATE jobs SET flags=?, llm_score=?, status=? WHERE id=?", writes)
+        """UPDATE jobs
+           SET flags=?, llm_score=?, status=?, pipeline_state=?
+           WHERE id=?""", writes)
     con.commit()
     con.close()
     print(f"\n[applied] 已更新 {len(writes)} 条。")

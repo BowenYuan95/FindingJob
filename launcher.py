@@ -13,9 +13,16 @@ import socket
 import logging
 import threading
 import subprocess
+import webbrowser
 
 import requests
 import webview
+
+
+class _Api:
+    """Python API exposed to JavaScript inside the webview."""
+    def open_url(self, url: str) -> None:
+        webbrowser.open(url)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +80,21 @@ def main() -> None:
         webbrowser.open(URL)
         return
 
-    webview.create_window("JobFinder", URL, width=1200, height=850)
+    start_backfill()
+
+    _JS = """(function(){
+        document.addEventListener('click', function(e){
+            var a = e.target.closest('a');
+            if (a && a.href && !a.href.includes('localhost')) {
+                e.preventDefault(); e.stopPropagation();
+                if (window.pywebview && window.pywebview.api)
+                    window.pywebview.api.open_url(a.href);
+            }
+        }, true);
+    })();"""
+
+    window = webview.create_window("JobFinder", URL, width=1200, height=850, js_api=_Api())
+    window.events.loaded += lambda: window.evaluate_js(_JS)
     webview.start()
 
     if st_proc:

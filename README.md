@@ -91,8 +91,11 @@ FindingJob/
 │   ├── job_matcher.py          # 主管线：抓取 → 硬筛 → embedding → LLM → 落库
 │   ├── hard_filter.py          # 确定性硬性淘汰层（regex，无 LLM 依赖）
 │   └── backfill_scores.py      # 后台 LLM 补评守护进程
+├── infrastructure/
+│   └── database.py             # SQLite 连接策略、WAL、迁移与索引
 │
 ├── sources/                    # 数据来源采集
+│   ├── adzuna_search.py        # Adzuna API 搜索 + 原生职位 ID 去重
 │   └── gmail_alerts.py         # Gmail OAuth + LLM 邮件解析（可选）
 │
 ├── scripts/                    # 运维 / 审计工具
@@ -163,3 +166,9 @@ FindingJob/
 | `status` | 待投 / 已投 / 面试 / 拒 / offer / DISQUALIFIED |
 | `summary` | LLM 生成的要点摘要（职责 / 要求 / 待遇） |
 | `note` | 用户自填备注（面试时间、联系人等） |
+| `pipeline_state` | INGESTED / EMBEDDING_REJECTED / EMBEDDING_FAILED / READY_FOR_LLM / SCORED / DISQUALIFIED |
+| `score_attempts` | LLM 评分尝试轮数 |
+| `last_error` | 最近一次模型或管线错误，成功后清空 |
+
+SQLite 统一使用 WAL、30 秒 busy timeout，并为 `(source, source_id)` 和后台评分队列建立索引。
+所有新采集职位都会入库；低于 embedding 阈值的记录保留为 `EMBEDDING_REJECTED`，不会显示在待投递列表。

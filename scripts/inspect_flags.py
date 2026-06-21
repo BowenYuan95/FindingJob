@@ -5,8 +5,9 @@ import sqlite3, json
 from collections import Counter
 
 from config import DB_PATH
+from infrastructure.database import initialize_database
 
-c = sqlite3.connect(DB_PATH)
+c = initialize_database(DB_PATH)
 rows = c.execute(
     "SELECT title, company, status, flags FROM jobs "
     "WHERE flags != '[]' AND flags != ''"

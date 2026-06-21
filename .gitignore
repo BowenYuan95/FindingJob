@@ -220,7 +220,10 @@ __marimo__/
 #secret files
 credentials.json 
 token.json 
-bowen95credentials
+*credentials*.json
+!credentials.example.json
 
 digest.md
 jobs.db
+*.db-wal
+*.db-shm

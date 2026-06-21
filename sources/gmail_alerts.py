@@ -19,6 +19,7 @@ import re
 import json
 import base64
 import logging
+import time
 from html.parser import HTMLParser
 
 import requests
@@ -131,7 +132,7 @@ def _denoise(body):
     return body[:cut_at].strip() or body
 
 
-def _llm_extract(body, src):
+def _llm_extract(body, src, _attempt=1):
     """把一封邮件正文交给 Qwen3.5,抽出职位数组。失败返回 None(触发降级)。"""
     prompt = f"""Extract ALL job listings from this {src} alert email.
 Output ONLY a JSON array. Your FIRST character must be '['. No thinking, no preamble, no explanation.
@@ -181,7 +182,11 @@ JSON array:"""
             })
         return out
     except Exception as e:
-        logger.warning(f"[gmail]   LLM 抽取失败({src}),退回正则: {e}")
+        logger.warning(f"[gmail]   LLM 抽取第 {_attempt}/3 次失败({src}): {e}")
+        if _attempt < 3:
+            time.sleep(2 ** (_attempt - 1))
+            return _llm_extract(body, src, _attempt + 1)
+        logger.warning(f"[gmail]   LLM 连续失败({src}),退回正则")
         return None
 
 def _regex_extract(body, src):
@@ -208,18 +213,32 @@ def fetch_gmail_alerts():
         return []
 
     query = f"label:{LABEL_NAME} newer_than:{MAX_DAYS_OLD}d"
+    msg_ids = []
+    page_token = None
     try:
-        resp = svc.users().messages().list(userId="me", q=query, maxResults=100).execute()
+        while True:
+            kwargs = {"userId": "me", "q": query, "maxResults": 100}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = svc.users().messages().list(**kwargs).execute(num_retries=3)
+            msg_ids.extend(resp.get("messages", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as e:
         logger.warning(f"[gmail] 列邮件失败: {e}")
         return []
-
-    msg_ids = resp.get("messages", [])
     logger.info(f"[gmail] 命中 {len(msg_ids)} 封 {LABEL_NAME} 邮件(近 {MAX_DAYS_OLD} 天)")
 
     jobs = []
     for m in msg_ids:
-        msg = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
+        try:
+            msg = svc.users().messages().get(
+                userId="me", id=m["id"], format="full"
+            ).execute(num_retries=3)
+        except Exception as e:
+            logger.warning(f"[gmail] 读取邮件 {m.get('id', '?')} 失败,跳过: {e}")
+            continue
         headers = {h["name"].lower(): h["value"] for h in msg["payload"].get("headers", [])}
         sender = headers.get("from", "").lower()
         src = ("seek"     if "seek"     in sender else

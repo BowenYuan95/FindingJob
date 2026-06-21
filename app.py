@@ -12,7 +12,8 @@ app.py — 求职匹配 + 申请追踪 Streamlit 面板
 """
 
 import os
-import sqlite3
+import sys
+import json
 import datetime as dt
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pandas as pd
 import streamlit as st
 
 from config import DB_PATH, LMSTUDIO_BASE
+from infrastructure.database import connect_db, database_session, initialize_database
 
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
 
@@ -33,7 +35,7 @@ st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", l
 @st.cache_data(ttl=60)
 def load_jobs() -> pd.DataFrame:
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = initialize_database(DB_PATH)
         df = pd.read_sql_query("SELECT * FROM jobs", con)
         con.close()
     except Exception as e:
@@ -55,28 +57,38 @@ def load_jobs() -> pd.DataFrame:
 
 
 def purge_expired_deadlines() -> int:
-    """Re-scan deadline flags on all 待投 jobs; mark newly expired ones DISQUALIFIED."""
-    from pipeline.hard_filter import scan_disqualifiers
+    """重扫待投岗位的截止日期,并同步 status / score / flags。"""
+    from pipeline.hard_filter import dedup_flags, scan_disqualifiers
     try:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            "SELECT id, title, description FROM jobs WHERE status='待投'"
-        ).fetchall()
-        updated = 0
-        for jid, title, desc in rows:
-            flags = scan_disqualifiers(title or "", desc or "")
-            dl = next((f for f in flags if f["code"] == "deadline_passed"), None)
-            if dl:
+        with database_session(DB_PATH) as con:
+            rows = con.execute(
+                "SELECT id, title, description, flags FROM jobs WHERE status='待投'"
+            ).fetchall()
+            updated = 0
+            for jid, title, desc, flags_json in rows:
+                rescanned = scan_disqualifiers(title or "", desc or "")
+                dl = next((f for f in rescanned if f["code"] == "deadline_passed"), None)
+                if not dl:
+                    continue
+                try:
+                    old_flags = json.loads(flags_json) if flags_json else []
+                except (TypeError, json.JSONDecodeError):
+                    old_flags = []
+                flags = dedup_flags(old_flags + [dl])
                 con.execute(
-                    "UPDATE jobs SET status='DISQUALIFIED', llm_reason=? WHERE id=?",
-                    (f"硬性淘汰:截止已过 {dl['evidence'][:80]}", jid),
+                    """UPDATE jobs
+                       SET status='DISQUALIFIED', llm_score=5,
+                           llm_reason=?, flags=?, pipeline_state='DISQUALIFIED',
+                           updated_at=?
+                       WHERE id=?""",
+                    (f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
+                     json.dumps(flags, ensure_ascii=False),
+                     dt.datetime.now().isoformat(timespec="seconds"), jid),
                 )
                 updated += 1
-        if updated:
-            con.commit()
-        con.close()
         return updated
-    except Exception:
+    except Exception as e:
+        st.warning(f"截止日期清理失败:{e}")
         return 0
 
 
@@ -85,7 +97,7 @@ def update_job(job_id: str, **fields: object) -> None:
     if not fields:
         return
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = connect_db(DB_PATH)
         sets = ", ".join(f"{k}=?" for k in fields)
         con.execute(f"UPDATE jobs SET {sets} WHERE id=?",
                     (*fields.values(), job_id))
@@ -96,11 +108,24 @@ def update_job(job_id: str, **fields: object) -> None:
 
 
 def set_status(job_id: str, status: str) -> None:
-    """改状态;非'待投'时记录日期、同步 applied 兼容字段。"""
+    """改状态;首次离开待投时记录投递日期,后续状态变化保留该日期。"""
     today = dt.date.today().isoformat()
+    applied_date = ""
+    if status != "待投":
+        try:
+            con = connect_db(DB_PATH)
+            try:
+                row = con.execute(
+                    "SELECT applied_date FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
+            finally:
+                con.close()
+            applied_date = (row[0] if row and row[0] else today)
+        except Exception:
+            applied_date = today
     update_job(job_id, status=status,
                applied=(0 if status == "待投" else 1),
-               applied_date=("" if status == "待投" else today))
+               applied_date=applied_date)
 
 
 def lmstudio_alive() -> bool:
@@ -121,9 +146,11 @@ def ensure_models_loaded():
     ]
     for c in cmds:
         try:
-            subprocess.run(c, shell=(os.name == "nt"), capture_output=True, timeout=120)
-        except Exception:
-            pass
+            result = subprocess.run(c, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        except Exception as e:
+            raise RuntimeError(f"模型加载失败 ({c[2]}): {e}") from e
 
 
 def trigger_backfill():
@@ -131,15 +158,16 @@ def trigger_backfill():
     import subprocess
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
-        subprocess.Popen(["py", "-m", "pipeline.backfill_scores"],
+        subprocess.Popen([sys.executable, "-m", "pipeline.backfill_scores"],
+                         cwd=os.path.dirname(os.path.abspath(__file__)),
                          creationflags=flags)
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"后台补评启动失败:{e}")
 
 
 def last_update_time() -> str:
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = connect_db(DB_PATH)
         row = con.execute("SELECT MAX(first_seen) FROM jobs").fetchone()
         con.close()
         return row[0] if row and row[0] else "—"
@@ -150,9 +178,11 @@ def last_update_time() -> str:
 def backfill_status() -> tuple[int, int]:
     """Returns (unscored_count, total_pending) — live query, no cache."""
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = connect_db(DB_PATH)
         unscored = con.execute(
-            "SELECT COUNT(*) FROM jobs WHERE llm_score IS NULL AND status='待投'"
+            """SELECT COUNT(*) FROM jobs
+               WHERE llm_score IS NULL AND status='待投'
+                 AND pipeline_state='READY_FOR_LLM'"""
         ).fetchone()[0]
         total = con.execute(
             "SELECT COUNT(*) FROM jobs WHERE status='待投'"
@@ -258,7 +288,9 @@ def render_todo() -> None:
     kw         = st.sidebar.text_input("关键词(标题/公司)", "").strip().lower()
     only_llm   = st.sidebar.checkbox("只看 LLM 复评过的", value=False)
 
-    v = df[(df["status"] == "待投") & df["source"].isin(pick_src) & (df["score"] >= min_score)]
+    visible_states = ["READY_FOR_LLM", "SCORED"]
+    v = df[(df["status"] == "待投") & df["pipeline_state"].isin(visible_states) &
+           df["source"].isin(pick_src) & (df["score"] >= min_score)]
     if kw:
         v = v[v["title"].str.lower().str.contains(kw, na=False) |
               v["company"].str.lower().str.contains(kw, na=False)]
@@ -288,7 +320,7 @@ def render_todo() -> None:
 
             bcol = st.columns([0.35, 0.4, 0.25])
             if isinstance(r["url"], str) and r["url"].strip():
-                bcol[0].markdown(f"[🔗 查看职位]({r['url']})")
+                bcol[0].link_button("🔗 查看职位", r["url"])
             # 状态选择(选了非待投即进追踪表)
             new_status = bcol[1].selectbox(
                 "状态", STATUSES, index=0, key=f"st_{r['id']}", label_visibility="collapsed")
@@ -311,7 +343,7 @@ def render_todo() -> None:
 # ================================================================
 
 def render_tracker() -> None:
-    tracked = df[df["status"] != "待投"].copy()
+    tracked = df[df["status"].isin([s for s in STATUSES if s != "待投"])].copy()
 
     # 顶部:各状态统计
     cols = st.columns(len(STATUSES) - 1 + 1)
@@ -341,7 +373,7 @@ def render_tracker() -> None:
             date = f" · 📅 {r['applied_date']}" if r["applied_date"] else ""
             st.caption(meta + date)
             if isinstance(r["url"], str) and r["url"].strip():
-                st.markdown(f"[🔗 查看职位]({r['url']})")
+                st.link_button("🔗 查看职位", r["url"])
 
             edit = st.columns([0.3, 0.7])
             cur_idx = STATUSES.index(r["status"]) if r["status"] in STATUSES else 0

@@ -10,6 +10,9 @@
 4. **LLM 复评**(`job_matcher.llm_review`)—— 本地 Qwen,给 base 分 + 自检 flags + 摘要。
 5. **异步补评**(`backfill_scores.py`)—— 空闲时把未评岗补完,封顶逻辑与主程序一致。
 
+数据库连接、迁移、WAL 与索引统一由 `infrastructure/database.py` 管理。采集结果必须全部
+入库并通过 `pipeline_state` 表达处理结果；不要重新引入“embedding 未过即静默丢弃”的逻辑。
+
 存量维护:`refresh_flags.py` 对数据库重跑 hard_filter 刷新 flags,**不重抓 Adzuna**。
 
 ## 核心设计哲学:宽搜窄评

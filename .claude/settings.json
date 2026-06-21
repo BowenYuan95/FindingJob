@@ -8,7 +8,8 @@
       "Bash(py -c \"import pipeline.backfill_scores; print\\('pipeline.backfill_scores OK'\\)\")",
       "Bash(py -c \"import pipeline; print\\('pipeline package OK'\\)\")",
       "Bash(py scripts/diagnose.py)",
-      "Bash(py scripts/refresh_flags.py)"
+      "Bash(py scripts/refresh_flags.py)",
+      "Bash(python -c ' *)"
     ]
   }
 }

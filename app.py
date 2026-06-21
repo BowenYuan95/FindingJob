@@ -49,7 +49,8 @@ def load_jobs() -> pd.DataFrame:
         return df
     # 字段兜底(旧库未迁移)
     for col, default in [("applied", 0), ("summary", ""), ("status", "待投"),
-                         ("applied_date", ""), ("note", "")]:
+                         ("applied_date", ""), ("note", ""),
+                         ("score_status", ""), ("applied_cap", None)]:
         if col not in df.columns:
             df[col] = default
     df["status"] = df["status"].fillna("待投").replace("", "待投")
@@ -297,6 +298,9 @@ def render_todo() -> None:
             st.caption(meta)
             if isinstance(r["llm_reason"], str) and r["llm_reason"].strip():
                 st.markdown(f"> {r['llm_reason']}")
+            if r.get("score_status") == "capped":
+                cap = r.get("applied_cap")
+                st.caption(f"⚠ 系统封顶: {cap:.0f}" if pd.notna(cap) else "⚠ 系统封顶")
 
             bcol = st.columns([0.35, 0.4, 0.25])
             job_url = normalize_job_url(r.get("url"))

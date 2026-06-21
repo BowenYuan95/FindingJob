@@ -54,7 +54,7 @@ def main():
     n = con.execute("""
         UPDATE jobs
         SET llm_score=NULL, pipeline_state='READY_FOR_LLM',
-            last_error='', score_attempts=0
+            last_error='', score_attempts=0, score_status='', applied_cap=NULL
         WHERE llm_score IS NOT NULL AND status != 'DISQUALIFIED'
     """).rowcount
     con.commit()

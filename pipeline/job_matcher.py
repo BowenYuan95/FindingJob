@@ -43,7 +43,7 @@ from config import (
 )
 
 # === [接线 1/3] 顶部导入确定性硬筛层 ===
-from .hard_filter import Flag, scan_disqualifiers, apply_flags
+from .hard_filter import Flag, scan_disqualifiers, apply_flags, dedup_flags
 
 # Gmail 解析模块(OAuth + LLM 抽取),见 sources/gmail_alerts.py
 GMAIL_IMPORT_ERROR: str | None = None
@@ -300,14 +300,12 @@ def llm_review(
             disc_reason = disc.get("discipline_reason", "")
             score = round(score * disc_mult)
 
-            # PhD scholarship(攻读博士的奖学金/招生名额,非受聘研究岗):硬性封顶 40。
-            # 与 discipline 同理:LLM 只识别 flag,封顶逻辑由 Python 拥有。
-            # 用 min() 而非强制赋值:已经低于 40 的(如 out_of_domain 折算后)不被抬高。
+            # PhD scholarship:LLM 只识别并生成 cap flag。实际封顶统一由
+            # apply_flags 执行，才能可靠记录是否真的发生 capped。
             PHD_SCHOLARSHIP_CAP = 40
             extra_flags: list[Flag] = []
             if "phd_scholarship" in llm_flags:
                 llm_flags = [f for f in llm_flags if f != "phd_scholarship"]
-                score = min(score, PHD_SCHOLARSHIP_CAP)
                 extra_flags.append({
                     "code": "phd_scholarship",
                     "label": f"PhD scholarship 封顶 {PHD_SCHOLARSHIP_CAP}",
@@ -417,6 +415,7 @@ def main(progress: Any = None) -> None:
         j["sim"] = j["sim_raw"] = 0.0
         j["llm_score"], j["llm_reason"], j["summary"] = None, "", ""
         j["pipeline_state"], j["score_attempts"], j["last_error"] = "INGESTED", 0, ""
+        j["score_status"], j["applied_cap"] = "", None
         if any(f["severity"] == "knockout" for f in j["flags"]):
             # Knockout uses a visible sentinel score of 5. min(base, cap) with
             # base=0 would incorrectly store 0 instead.
@@ -424,6 +423,8 @@ def main(progress: Any = None) -> None:
             j["llm_reason"] = "硬性淘汰:" + ";".join(
                 f["label"] for f in j["flags"] if f["severity"] == "knockout")
             j["pipeline_state"] = "DISQUALIFIED"
+            j["score_status"] = "DISQUALIFIED"
+            j["applied_cap"] = min(f["cap"] for f in j["flags"])
             knocked.append(j)
         else:
             gated.append(j)
@@ -484,12 +485,21 @@ def main(progress: Any = None) -> None:
         for idx, j in enumerate(new_jobs[:n], 1):
             score, reason, summary, llm_flags = llm_review(PROFILE, j)
             # 合并:hard_filter 正则 flags + LLM 自检 flags
-            j["flags"] = (j.get("flags") or []) + llm_flags_to_objs(llm_flags)
+            j["flags"] = dedup_flags(
+                (j.get("flags") or []) + llm_flags_to_objs(llm_flags)
+            )
+            score_status = ""
+            applied_cap = None
             if score is not None and j["flags"]:
-                score, st = apply_flags(score, j["flags"])
-                if st != "ok":
-                    reason = f"[{st}] " + reason
+                score, score_status = apply_flags(score, j["flags"])
+                if score_status != "ok":
+                    reason = f"[{score_status}] " + reason
+                if score_status in {"capped", "DISQUALIFIED"}:
+                    applied_cap = min(f["cap"] for f in j["flags"])
+            elif score is not None:
+                score_status = "ok"
             j["llm_score"], j["llm_reason"], j["summary"] = score, reason, summary
+            j["score_status"], j["applied_cap"] = score_status, applied_cap
             j["score_attempts"] += 1
             if score is None:
                 j["pipeline_state"] = "READY_FOR_LLM"

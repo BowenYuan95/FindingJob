@@ -1,6 +1,7 @@
 """Central SQLite connection policy and schema migrations."""
 
 import os
+import json
 import sqlite3
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -58,7 +59,9 @@ def initialize_database(path: str = DB_PATH) -> sqlite3.Connection:
             pipeline_state TEXT DEFAULT 'INGESTED',
             score_attempts INTEGER DEFAULT 0,
             last_error TEXT DEFAULT '',
-            updated_at TEXT DEFAULT ''
+            updated_at TEXT DEFAULT '',
+            score_status TEXT DEFAULT '',
+            applied_cap REAL
         )""")
 
     columns = {row[1] for row in con.execute("PRAGMA table_info(jobs)")}
@@ -75,10 +78,90 @@ def initialize_database(path: str = DB_PATH) -> sqlite3.Connection:
         ("score_attempts", "score_attempts INTEGER DEFAULT 0"),
         ("last_error", "last_error TEXT DEFAULT ''"),
         ("updated_at", "updated_at TEXT DEFAULT ''"),
+        ("score_status", "score_status TEXT DEFAULT ''"),
+        ("applied_cap", "applied_cap REAL"),
     ]
+    normalize_score_metadata = False
     for name, ddl in migrations:
         if name not in columns:
             con.execute(f"ALTER TABLE jobs ADD COLUMN {ddl}")
+            if name in {"score_status", "applied_cap"}:
+                normalize_score_metadata = True
+
+    if normalize_score_metadata:
+        rows = con.execute(
+            "SELECT id,llm_score,llm_reason,status,flags FROM jobs"
+        ).fetchall()
+    else:
+        # Covers a still-running pre-migration worker that scores a row without
+        # populating the new metadata columns.
+        rows = con.execute("""
+            SELECT id,llm_score,llm_reason,status,flags FROM jobs
+            WHERE score_status='' AND llm_score IS NOT NULL
+        """).fetchall()
+    if rows:
+        for job_id, score, reason, status, flags_json in rows:
+            try:
+                flags = json.loads(flags_json) if flags_json else []
+            except (TypeError, json.JSONDecodeError):
+                flags = []
+            caps = [float(flag["cap"]) for flag in flags if "cap" in flag]
+            strictest_cap = min(caps) if caps else None
+            clean_reason = str(reason or "")
+            if clean_reason.startswith("[capped] "):
+                clean_reason = clean_reason[len("[capped] "):]
+
+            if status == "DISQUALIFIED":
+                score_status = "DISQUALIFIED"
+                applied_cap = strictest_cap
+            elif score is None:
+                score_status = ""
+                applied_cap = None
+            elif (strictest_cap is not None and strictest_cap < 100
+                  and abs(float(score) - strictest_cap) < 1e-9):
+                score_status = "capped"
+                applied_cap = strictest_cap
+                clean_reason = "[capped] " + clean_reason
+            else:
+                score_status = "ok"
+                applied_cap = None
+
+            con.execute("""
+                UPDATE jobs
+                SET score_status=?, applied_cap=?, llm_reason=?
+                WHERE id=?
+            """, (score_status, applied_cap, clean_reason, job_id))
+
+    # A knockout flag is authoritative even if an older worker forgot to sync status.
+    knockout_rows = con.execute("""
+        SELECT id,llm_score,llm_reason,flags FROM jobs
+        WHERE status!='DISQUALIFIED' AND flags LIKE '%"severity": "knockout"%'
+    """).fetchall()
+    for job_id, score, reason, flags_json in knockout_rows:
+        try:
+            flags = json.loads(flags_json) if flags_json else []
+        except (TypeError, json.JSONDecodeError):
+            continue
+        knockout_caps = [
+            float(flag["cap"]) for flag in flags
+            if flag.get("severity") == "knockout" and "cap" in flag
+        ]
+        if not knockout_caps:
+            continue
+        cap = min(knockout_caps)
+        clean_reason = str(reason or "")
+        if clean_reason.startswith("[capped] "):
+            clean_reason = clean_reason[len("[capped] "):]
+        if not clean_reason.startswith("[DISQUALIFIED] "):
+            clean_reason = "[DISQUALIFIED] " + clean_reason
+        con.execute("""
+            UPDATE jobs
+            SET llm_score=?, llm_reason=?, status='DISQUALIFIED',
+                pipeline_state='DISQUALIFIED', score_status='DISQUALIFIED',
+                applied_cap=?
+            WHERE id=?
+        """, (min(float(score), cap) if score is not None else cap,
+              clean_reason, cap, job_id))
 
     # Normalize legacy rows after adding pipeline_state without overwriting
     # explicit rejection/failure states created by the new pipeline.

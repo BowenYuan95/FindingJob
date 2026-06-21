@@ -164,6 +164,8 @@ FindingJob/
 | `sim` | Nomic embedding 余弦相似度（0-1） |
 | `llm_score` | Qwen 打分（0-100）；NULL = 待 backfill |
 | `llm_reason` | 一句话中文理由 |
+| `score_status` | ok / capped / DISQUALIFIED；只有最终分实际降低才是 capped |
+| `applied_cap` | 实际生效的封顶值；未封顶时为 NULL |
 | `flags` | JSON 数组，每项含 code / label / cap / severity / evidence；含 `discipline` 条目记录学科乘数 |
 | `status` | 待投 / 已投 / 面试 / 拒 / offer / DISQUALIFIED |
 | `summary` | LLM 生成的要点摘要（职责 / 要求 / 待遇） |

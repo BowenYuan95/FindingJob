@@ -101,7 +101,19 @@ def main():
                 else "READY_FOR_LLM" if new_score is None
                 else "SCORED"
             )
-            writes.append((new_fl_json, new_score, new_status, pipeline_state, jid))
+            caps = [f["cap"] for f in new_flags if "cap" in f]
+            strictest_cap = min(caps) if caps else None
+            if new_status == "DISQUALIFIED":
+                score_status, applied_cap = "DISQUALIFIED", strictest_cap
+            elif new_score is None:
+                score_status, applied_cap = "", None
+            elif (strictest_cap is not None and strictest_cap < 100
+                  and float(new_score) == float(strictest_cap)):
+                score_status, applied_cap = "capped", strictest_cap
+            else:
+                score_status, applied_cap = "ok", None
+            writes.append((new_fl_json, new_score, new_status, pipeline_state,
+                           score_status, applied_cap, jid))
             if action in examples and len(examples[action]) < 8:
                 examples[action].append(f"{(title or '')[:42]} | {company or ''}")
 
@@ -125,7 +137,8 @@ def main():
 
     con.executemany(
         """UPDATE jobs
-           SET flags=?, llm_score=?, status=?, pipeline_state=?
+           SET flags=?, llm_score=?, status=?, pipeline_state=?,
+               score_status=?, applied_cap=?
            WHERE id=?""", writes)
     con.commit()
     con.close()

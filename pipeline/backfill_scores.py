@@ -118,7 +118,9 @@ def score_one(con: sqlite3.Connection, row: tuple) -> bool:
         reason=reason,
         summary=summary,
         flags=flags,
-        disqualified=(st == "DISQUALIFIED"),
+        score_status=st,
+        applied_cap=(min(f["cap"] for f in flags)
+                     if st in {"capped", "DISQUALIFIED"} else None),
         now=now,
     )
     con.commit()           # 逐条提交,面板立即可见

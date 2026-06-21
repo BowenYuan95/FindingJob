@@ -91,7 +91,8 @@ class JobRepository:
         self.con.execute("""
             UPDATE jobs
             SET status='DISQUALIFIED', llm_score=5, llm_reason=?, flags=?,
-                pipeline_state='DISQUALIFIED', updated_at=?
+                pipeline_state='DISQUALIFIED', updated_at=?,
+                score_status='DISQUALIFIED', applied_cap=5
             WHERE id=?
         """, (reason, flags_json, now, job_id))
 
@@ -111,8 +112,8 @@ class JobRepository:
             (id,title,company,location,description,url,source,source_id,salary,created,
              sim,llm_score,llm_reason,first_seen,summary,flags,
              pipeline_state,score_attempts,last_error,updated_at,
-             applied,status,applied_date,note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             score_status,applied_cap,applied,status,applied_date,note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
               title=excluded.title, company=excluded.company, location=excluded.location,
               description=excluded.description, url=excluded.url, source=excluded.source,
@@ -122,6 +123,7 @@ class JobRepository:
               pipeline_state=excluded.pipeline_state,
               score_attempts=jobs.score_attempts + excluded.score_attempts,
               last_error=excluded.last_error, updated_at=excluded.updated_at,
+              score_status=excluded.score_status, applied_cap=excluded.applied_cap,
               status=CASE WHEN excluded.status='DISQUALIFIED'
                           THEN 'DISQUALIFIED' ELSE jobs.status END""",
             (job["id"], job["title"], job["company"], job["location"],
@@ -130,7 +132,8 @@ class JobRepository:
              job["llm_reason"], now, job.get("summary", ""),
              json.dumps(job.get("flags", []), ensure_ascii=False),
              job.get("pipeline_state", "INGESTED"), job.get("score_attempts", 0),
-             job.get("last_error", ""), now, 0, status, "", ""))
+             job.get("last_error", ""), now, job.get("score_status", ""),
+             job.get("applied_cap"), 0, status, "", ""))
 
     def count_ready_for_scoring(self) -> int:
         return self.con.execute("""
@@ -173,7 +176,8 @@ class JobRepository:
         reason: str,
         summary: str,
         flags: list[dict],
-        disqualified: bool,
+        score_status: str,
+        applied_cap: float | None,
         now: str,
     ) -> None:
         self.con.execute("""
@@ -181,7 +185,9 @@ class JobRepository:
             SET llm_score=?, llm_reason=?, summary=?, flags=?,
                 status=CASE WHEN ? THEN 'DISQUALIFIED' ELSE status END,
                 pipeline_state=CASE WHEN ? THEN 'DISQUALIFIED' ELSE 'SCORED' END,
-                score_attempts=score_attempts+1, last_error='', updated_at=?
+                score_attempts=score_attempts+1, last_error='', updated_at=?,
+                score_status=?, applied_cap=?
             WHERE id=?
         """, (score, reason, summary, json.dumps(flags, ensure_ascii=False),
-              disqualified, disqualified, now, job_id))
+              score_status == "DISQUALIFIED", score_status == "DISQUALIFIED",
+              now, score_status, applied_cap, job_id))

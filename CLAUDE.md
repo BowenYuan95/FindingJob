@@ -39,6 +39,7 @@
 - warn(封顶但保留可见):`degree_field`(20) `wet_lab`(25) `clinical_delivery`(30)
   `seniority`(35) `unrelated_domain`(30)
 - 最终分 = `min(base, min(命中 flag 的 cap))`;任一 knockout → status=DISQUALIFIED。
+- `capped` 仅表示 `final_score < base_score`;仅存在 flag、但分数未降低时必须保持 `ok`。
 - 合并正则 flags + LLM 自检 flags 后必须 `dedup_flags` 去重再 `apply_flags`。
 
 ## 打分 rubric(权重 40/25/20/10/5,学术/产业五五开)

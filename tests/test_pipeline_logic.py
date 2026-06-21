@@ -8,6 +8,7 @@ from unittest.mock import patch
 import numpy as np
 
 from pipeline import backfill_scores, job_matcher
+from pipeline.hard_filter import apply_flags
 from scripts.refresh_flags import plan_row
 from sources import adzuna_search
 from sources.gmail_alerts import _denoise, _restore_url
@@ -28,6 +29,20 @@ class FakeResponse:
 
 
 class PipelineLogicTests(unittest.TestCase):
+    def test_apply_flags_marks_capped_only_when_score_is_reduced(self):
+        discipline = [{
+            "code": "discipline", "label": "in domain", "cap": 100,
+            "severity": "warn", "evidence": "test",
+        }]
+        self.assertEqual(apply_flags(85, discipline), (85, "ok"))
+
+        scholarship = [{
+            "code": "phd_scholarship", "label": "scholarship", "cap": 40,
+            "severity": "warn", "evidence": "test",
+        }]
+        self.assertEqual(apply_flags(85, scholarship), (40, "capped"))
+        self.assertEqual(apply_flags(35, scholarship), (35, "ok"))
+
     def test_gmail_long_url_placeholder_is_reversible(self):
         url = "https://example.test/redirect?token=" + "a" * 120
         body, url_map = _denoise(f"Researcher at Example {url}")

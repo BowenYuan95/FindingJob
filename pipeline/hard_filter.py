@@ -278,7 +278,9 @@ def apply_flags(
     cap = min(f["cap"] for f in flags)
     disq = any(f["severity"] == "knockout" for f in flags)
     final = min(base_score, cap)
-    return final, ("DISQUALIFIED" if disq else "capped")
+    if disq:
+        return final, "DISQUALIFIED"
+    return final, ("capped" if final < base_score else "ok")
 
 
 # ------------------------------------------------------------

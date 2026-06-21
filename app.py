@@ -14,6 +14,7 @@ app.py — 求职匹配 + 申请追踪 Streamlit 面板
 import os
 import sys
 import json
+import webbrowser
 import datetime as dt
 from pathlib import Path
 
@@ -320,7 +321,8 @@ def render_todo() -> None:
 
             bcol = st.columns([0.35, 0.4, 0.25])
             if isinstance(r["url"], str) and r["url"].strip():
-                bcol[0].link_button("🔗 查看职位", r["url"])
+                if bcol[0].button("🔗 查看职位", key=f"url_{r['id']}"):
+                    webbrowser.open(r["url"])
             # 状态选择(选了非待投即进追踪表)
             new_status = bcol[1].selectbox(
                 "状态", STATUSES, index=0, key=f"st_{r['id']}", label_visibility="collapsed")
@@ -373,7 +375,8 @@ def render_tracker() -> None:
             date = f" · 📅 {r['applied_date']}" if r["applied_date"] else ""
             st.caption(meta + date)
             if isinstance(r["url"], str) and r["url"].strip():
-                st.link_button("🔗 查看职位", r["url"])
+                if st.button("🔗 查看职位", key=f"url_{r['id']}"):
+                    webbrowser.open(r["url"])
 
             edit = st.columns([0.3, 0.7])
             cur_idx = STATUSES.index(r["status"]) if r["status"] in STATUSES else 0

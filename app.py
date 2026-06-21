@@ -14,6 +14,7 @@ app.py — 求职匹配 + 申请追踪 Streamlit 面板
 import os
 import sqlite3
 import datetime as dt
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -120,6 +121,40 @@ def last_update_time() -> str:
         return "—"
 
 
+def backfill_status() -> tuple[int, int]:
+    """Returns (unscored_count, total_pending) — live query, no cache."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        unscored = con.execute(
+            "SELECT COUNT(*) FROM jobs WHERE llm_score IS NULL AND status='待投'"
+        ).fetchone()[0]
+        total = con.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='待投'"
+        ).fetchone()[0]
+        con.close()
+        return unscored, total
+    except Exception:
+        return 0, 0
+
+
+@st.fragment(run_every=8)
+def _backfill_progress_panel() -> None:
+    init = st.session_state.get("backfill_initial", 0)
+    unscored, _ = backfill_status()
+    if init == 0 and unscored == 0:
+        return
+    if unscored == 0:
+        st.success("✅ 补评全部完成")
+        if "backfill_initial" in st.session_state:
+            del st.session_state["backfill_initial"]
+    elif init > 0:
+        done = max(0, init - unscored)
+        frac = done / init
+        st.progress(frac, text=f"后台补评 {done}/{init} ({frac:.0%})")
+    else:
+        st.caption(f"🔄 待补评: {unscored} 条")
+
+
 # ----------------------------------------------------------------
 # 侧栏:一键更新 + 视图切换
 # ----------------------------------------------------------------
@@ -135,13 +170,27 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
     else:
         before = len(df)
         bar = st.sidebar.progress(0.0, text="加载模型中…")
+        llm_label = st.sidebar.empty()
+        llm_bar2  = st.sidebar.empty()
         try:
             ensure_models_loaded()          # 确保模型在(上轮可能已卸载)
             import importlib
             from pipeline import job_matcher
             importlib.reload(job_matcher)
-            def on_progress(frac, msg):
+            def on_progress(frac: float, msg: str) -> None:
                 bar.progress(min(max(frac, 0.0), 1.0), text=msg)
+                if msg.startswith("LLM 复评"):
+                    try:
+                        parts = msg[len("LLM 复评 "):].split(": ", 1)
+                        cur, total = map(int, parts[0].split("/"))
+                        title = parts[1] if len(parts) > 1 else ""
+                        llm_label.markdown(f"**🧠 LLM 打分** · {cur}/{total} ({cur / total:.0%})")
+                        llm_bar2.progress(cur / total, text=f"正在评:{title[:25]}")
+                    except Exception:
+                        pass
+                else:
+                    llm_label.empty()
+                    llm_bar2.empty()
             job_matcher.main(progress=on_progress)
             st.cache_data.clear()
         except Exception as e:
@@ -149,11 +198,17 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
         else:
             after = len(load_jobs())
             bar.empty()
+            llm_label.empty()
+            llm_bar2.empty()
             trigger_backfill()              # 后台评剩余,评完自动卸载模型
+            unscored_now, _ = backfill_status()
+            st.session_state["backfill_initial"] = unscored_now
             st.sidebar.success(f"完成!新增 {max(0, after - before)} 条。"
                                f"后台正在补评剩余,完成后会自动卸载模型。")
             st.rerun()
 
+with st.sidebar:
+    _backfill_progress_panel()
 st.sidebar.divider()
 view = st.sidebar.radio("视图", ["📋 待投递", "📊 申请追踪"], label_visibility="collapsed")
 

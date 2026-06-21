@@ -259,8 +259,18 @@ def llm_review(
 == 第三件事:要点式摘要(summary,字符串数组)==
 中文为主,专业术语保留英文。每条开头标注类别,覆盖 职责/要求/待遇,每类 1-3 条。
 
+== 第四件事:核心学科分类(discipline)==
+只看主线职责与选拔标准,忽略通用措辞(innovation/R&D/cutting-edge)和 desirable-only 项。
+把该岗位的核心学科分入且仅分入以下三类之一:
+- "in_domain"     CS/HCI/XR/HRI/ML-AI/数字健康为核心          -> discipline_multiplier 1.0
+- "adjacent"      机器人/传感/人因/通用SWE/comp-design 可桥接   -> discipline_multiplier 0.8
+- "out_of_domain" 机械/土木/化工/纯硬件/台架实验/临床心理       -> discipline_multiplier 0.5
+判断依据:若岗位核心职责要求候选人拥有其没有且无法诚实桥接的学位或动手经验,则 out_of_domain。
+
 只输出如下 JSON(数组里别放换行):
-{{"score": <int 0-100>, "reason": "<一句话中文>", "flags": ["..."], "summary": ["职责:...", "要求:...", "待遇:..."]}}
+{{"score": <int 0-100>, "reason": "<一句话中文>", "flags": ["..."], "summary": ["职责:...", "要求:...", "待遇:..."],
+  "discipline": {{"core_discipline": "<具体学科名>", "discipline_class": "in_domain|adjacent|out_of_domain",
+                  "discipline_multiplier": 1.0, "discipline_reason": "<≤30字中文>"}}}}
 """
     try:
         r = requests.post(f"{LMSTUDIO_BASE}/chat/completions",
@@ -286,16 +296,35 @@ def llm_review(
         llm_flags = obj.get("flags", []) or []
         if not isinstance(llm_flags, list):
             llm_flags = []
-        return score, str(obj.get("reason", "")), sm, llm_flags
+
+        # Discipline multiplier — LLM classifies, Python applies (CLAUDE.md red line)
+        disc      = obj.get("discipline") or {}
+        disc_cls  = disc.get("discipline_class", "in_domain")
+        disc_mult = disc.get("discipline_multiplier", 1.0)
+        if disc_mult not in (1.0, 0.8, 0.5):   # clamp to legal values
+            disc_mult = 1.0
+        disc_reason = disc.get("discipline_reason", "")
+        if disc_mult < 1.0 and score is not None:
+            score = round(score * disc_mult)
+        disc_flag: Flag = {
+            "code": "discipline",
+            "label": f"学科:{disc_cls}×{disc_mult}",
+            "cap": 100,
+            "severity": "warn",
+            "evidence": disc_reason or f"({disc_cls})",
+        }
+        return score, str(obj.get("reason", "")), sm, llm_flags + [disc_flag]
     except Exception as e:
         return None, f"(LLM 打分失败: {e})", "", []
 
 
-def llm_flags_to_objs(codes: list[str]) -> list[Flag]:
-    """Convert LLM-returned flag codes to Flag dicts compatible with apply_flags."""
+def llm_flags_to_objs(codes: list) -> list[Flag]:
+    """Convert LLM-returned flag codes (or pre-built Flag dicts) to Flag dicts."""
     out = []
     for c in codes:
-        if c in LLM_FLAG_CAPS:
+        if isinstance(c, dict):          # pre-built Flag (e.g. discipline), pass through
+            out.append(c)
+        elif c in LLM_FLAG_CAPS:
             cap = LLM_FLAG_CAPS[c]
             out.append({"code": c, "label": f"LLM:{c}", "cap": cap,
                         "severity": "knockout" if cap <= 5 else "warn",

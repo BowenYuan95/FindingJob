@@ -31,7 +31,7 @@ from infrastructure.database import database_session, initialize_database
 from infrastructure.job_repository import JobRepository
 from infrastructure.lmstudio import LM_CLIENT
 from .job_matcher import llm_review, llm_flags_to_objs
-from .hard_filter import apply_flags, dedup_flags
+from .hard_filter import apply_flags, dedup_flags, scan_disqualifiers
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +99,10 @@ def score_one(con: sqlite3.Connection, row: tuple) -> bool:
         logger.warning(f"  ✗ {(title or '')[:40]} -> 打分失败,跳过本次")
         return False
 
-    # 复用入库时 hard_filter 存的正则 flags + 本次 LLM 自检 flags,统一封顶
-    try:
-        flags = json.loads(flags_json) if flags_json else []
-    except Exception:
-        flags = []
-    flags = dedup_flags(flags + llm_flags_to_objs(llm_flags))
+    # 重新跑确定性正则 flags(不依赖库里旧 flags——旧值可能为空或过时),
+    # 再并入本次 LLM 自检 flags,与 main() 完全对齐。
+    regex_flags = scan_disqualifiers(title or "", description or "")
+    flags = dedup_flags(regex_flags + llm_flags_to_objs(llm_flags))
     st = "ok"
     if flags:
         score, st = apply_flags(score, flags)

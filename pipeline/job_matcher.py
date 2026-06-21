@@ -208,6 +208,10 @@ def llm_review(
    Research Associate)、Level A-B 教职、digital health 里的 AI/分析。
    完全命中 32-40;相邻可桥接(HCI→HRI、研究→应用 ML、XR→3D/CV)20-31;
    勉强沾边 8-19;基本不沾 0-7。
+   ⚠ robotics 边界:候选人的 "robot/agent" 经验是【虚拟 LLM 具身 agent/avatar】,
+   非【物理机器人】。若岗位核心是 physical robotic control / sensor fusion /
+   autonomous-operation algorithms / ROS / motion planning / field robotics,
+   不论 JD 多少 AI/robotics 关键词,领域只能算"相邻可桥接"(≤31),不得给到完全命中。
    注:学术研究岗与产业 R&D / 应用 ML / AI 工程岗,只要领域匹配度相同给分相同;
    不因"是不是学术岗"本身加减分(学术/产业五五开)。
 2. 技能/技术栈重叠(25)—— 与画像中"有实证"技能的真实重叠。

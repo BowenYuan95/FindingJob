@@ -4,6 +4,7 @@
 #   1. start Streamlit silently in background (headless, no browser)
 #   2. start backfill in background thread (60s delay)
 #   3. open a native desktop window pointing to the dashboard
+#   4. on window close: terminate backfill (if still running) + unload LLM models
 # deps:  py -m pip install pywebview streamlit pandas requests
 
 import os
@@ -30,6 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8501
 URL  = f"http://localhost:{PORT}"
 
+_backfill_proc: list[subprocess.Popen] = []   # mutable holder; set by background thread
+
 
 def _port_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -54,11 +57,27 @@ def start_backfill() -> None:
         time.sleep(60)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            subprocess.Popen([sys.executable, "-m", "pipeline.backfill_scores", "--watch"],
-                             cwd=HERE, creationflags=flags)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pipeline.backfill_scores"],  # no --watch: exits + unloads when done
+                cwd=HERE, creationflags=flags)
+            _backfill_proc.append(proc)
         except Exception as e:
             logger.warning(f"[launcher] backfill failed: {e}")
     threading.Thread(target=_run, daemon=True).start()
+
+
+def unload_models() -> None:
+    """Unload LLM models from LM Studio to free VRAM/RAM."""
+    for m in ["qwen/qwen3.5-9b", "text-embedding-nomic-embed-text-v1.5"]:
+        try:
+            subprocess.run(
+                ["lms", "unload", m],
+                capture_output=True, timeout=30,
+                shell=(os.name == "nt"),
+            )
+            logger.info(f"[launcher] 已卸载 {m}")
+        except Exception as e:
+            logger.warning(f"[launcher] 卸载 {m} 失败: {e}")
 
 
 def wait_until_ready(timeout: int = 60) -> bool:
@@ -76,7 +95,6 @@ def main() -> None:
     st_proc = start_streamlit()
 
     if not wait_until_ready():
-        import webbrowser
         webbrowser.open(URL)
         return
 
@@ -96,6 +114,15 @@ def main() -> None:
     window = webview.create_window("JobFinder", URL, width=1200, height=850, js_api=_Api())
     window.events.loaded += lambda: window.evaluate_js(_JS)
     webview.start()
+
+    # Window closed — clean up regardless of whether backfill finished
+    if _backfill_proc:
+        try:
+            _backfill_proc[0].terminate()
+            logger.info("[launcher] backfill 进程已终止")
+        except Exception:
+            pass
+    unload_models()
 
     if st_proc:
         try:

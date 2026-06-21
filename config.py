@@ -120,6 +120,13 @@ human-robot interaction (as an HCI-to-HRI extension), applied/interaction ML,
 digital health & immersive technologies, advanced analytics in research or
 health contexts.
 
+# IMPORTANT robotics boundary: my "robot/agent" work is VIRTUAL LLM-driven
+# embodied agents / avatars in Unity, NOT physical robotics. I do NOT have
+# experience in physical robot control, sensor fusion, autonomous-operation
+# algorithms, ROS, motion planning, or field robotics. Roles centred on
+# physical robotic control / autonomy are at best adjacent-bridgeable, not a
+# core match — score their domain fit lower accordingly.
+
 # Location
 Australia — Melbourne (home base), Adelaide, Sydney, Brisbane, Canberra — or
 remote / hybrid / relocation-supported within Australia.

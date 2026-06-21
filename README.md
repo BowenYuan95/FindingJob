@@ -8,11 +8,11 @@
 
 - **多源抓取**：Adzuna 官方 API（免费）+ Gmail Job Alert 邮件解析（Seek / Indeed / LinkedIn）
 - **三层精排**：
-  1. **硬性淘汰**（`hard_filter.py`）：安全许可、AHPRA 注册要求、排他性公民身份、截止已过、湿实验室、临床交付等
+  1. **硬性淘汰**（`pipeline/hard_filter.py`）：安全许可、AHPRA 注册要求、排他性公民身份、截止已过、湿实验室、临床交付等
   2. **语义初筛**：Nomic Embed Text 向量余弦相似度（阈值 0.60）+ 级别降权
   3. **LLM 复评**：Qwen3.5-9B 对 top-50 逐条打分（0-100）+ 输出摘要 + 自检 flags
 - **Streamlit 面板**：双视图——「待投递」排序列表 + 「申请追踪」状态管理
-- **后台补评**：`backfill_scores.py` 在后台持续给还没 LLM 分的职位补评，逐条写库，面板实时可见
+- **后台补评**：`pipeline/backfill_scores.py` 在后台持续给还没 LLM 分的职位补评，逐条写库，面板实时可见
 - **桌面窗口**：`launcher.py` 用 pywebview 打开原生桌面窗口，无需浏览器
 
 ---
@@ -71,7 +71,7 @@ streamlit run app.py
 在 Streamlit 面板左侧栏点击「🔄 一键更新」，会自动：
 1. 从 Adzuna 和 Gmail 抓取新职位
 2. 运行硬性淘汰 → embedding 初筛 → LLM 复评
-3. 写入 `jobs.db`，后台启动 `backfill_scores.py` 补评剩余职位
+3. 写入 `jobs.db`，后台启动 `pipeline/backfill_scores.py` 补评剩余职位
 
 ---
 
@@ -79,22 +79,29 @@ streamlit run app.py
 
 ```
 FindingJob/
-├── config.py            # 单一配置源：所有常量、候选人画像、日志格式
-├── job_matcher.py       # 主管线：抓取 → 硬筛 → embedding → LLM → 落库
-├── hard_filter.py       # 确定性硬性淘汰层（regex，无 LLM 依赖）
-├── backfill_scores.py   # 后台 LLM 补评守护进程
-├── gmail_alerts.py      # Gmail OAuth + LLM 邮件解析（可选）
-├── app.py               # Streamlit 面板（待投递 + 申请追踪）
-├── launcher.py          # pywebview 桌面窗口封装
-├── refresh_flags.py     # 对存量数据重跑 hard_filter，刷新 flags
-├── diagnose.py          # 快速审计：检查是否有分数超出封顶值的记录
-├── inspect_flags.py     # 列出所有带 flag 的职位及命中次数统计
-├── jobs.db              # SQLite 数据库（运行后自动生成）
-├── digest.md            # 每次更新后输出的排序结果（便于审计）
-├── run_jobfinder.bat    # Windows 启动脚本（桌面窗口模式）
-├── start_app.bat        # Windows 启动脚本（浏览器模式）
-├── launch_app.vbs       # 静默启动（可用于计划任务）
-└── .env                 # Adzuna API 密钥（不提交到 git）
+├── config.py                   # 单一配置源：所有常量、候选人画像、日志格式
+├── app.py                      # Streamlit 面板（待投递 + 申请追踪）
+├── launcher.py                 # pywebview 桌面窗口封装
+│
+├── pipeline/                   # 核心匹配管线
+│   ├── job_matcher.py          # 主管线：抓取 → 硬筛 → embedding → LLM → 落库
+│   ├── hard_filter.py          # 确定性硬性淘汰层（regex，无 LLM 依赖）
+│   └── backfill_scores.py      # 后台 LLM 补评守护进程
+│
+├── sources/                    # 数据来源采集
+│   └── gmail_alerts.py         # Gmail OAuth + LLM 邮件解析（可选）
+│
+├── scripts/                    # 运维 / 审计工具
+│   ├── refresh_flags.py        # 对存量数据重跑 hard_filter，刷新 flags
+│   ├── diagnose.py             # 快速审计：检查是否有分数超出封顶值的记录
+│   └── inspect_flags.py        # 列出所有带 flag 的职位及命中次数统计
+│
+├── jobs.db                     # SQLite 数据库（运行后自动生成）
+├── digest.md                   # 每次更新后输出的排序结果（便于审计）
+├── run_jobfinder.bat           # Windows 启动脚本（桌面窗口模式）
+├── start_app.bat               # Windows 启动脚本（浏览器模式）
+├── launch_app.vbs              # 静默启动（可用于计划任务）
+└── .env                        # Adzuna API 密钥（不提交到 git）
 ```
 
 ---
@@ -126,14 +133,14 @@ FindingJob/
 
 ## 运维脚本
 
-| 脚本 | 用途 |
+| 命令 | 用途 |
 |------|------|
-| `py backfill_scores.py` | 手动补评所有未打分职位，完成后卸载模型 |
-| `py backfill_scores.py --watch` | 守护模式，每 60 秒扫一次 |
-| `py refresh_flags.py` | 干运行：预览 hard_filter 重刷会改哪些记录 |
-| `py refresh_flags.py --apply` | 实际写库：刷新所有 flags，knockout 立即出局，其余清 NULL 等 backfill 重评 |
-| `py diagnose.py` | 检查是否存在分数超出封顶值的异常记录 |
-| `py inspect_flags.py` | 列出所有带 flag 的职位及各 flag 命中次数 |
+| `py -m pipeline.backfill_scores` | 手动补评所有未打分职位，完成后卸载模型 |
+| `py -m pipeline.backfill_scores --watch` | 守护模式，每 60 秒扫一次 |
+| `py scripts/refresh_flags.py` | 干运行：预览 hard_filter 重刷会改哪些记录 |
+| `py scripts/refresh_flags.py --apply` | 实际写库：刷新所有 flags，knockout 立即出局，其余清 NULL 等 backfill 重评 |
+| `py scripts/diagnose.py` | 检查是否存在分数超出封顶值的异常记录 |
+| `py scripts/inspect_flags.py` | 列出所有带 flag 的职位及各 flag 命中次数 |
 
 ---
 

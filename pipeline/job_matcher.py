@@ -39,11 +39,11 @@ from config import (
 )
 
 # === [接线 1/3] 顶部导入确定性硬筛层 ===
-from hard_filter import Flag, scan_disqualifiers, apply_flags
+from .hard_filter import Flag, scan_disqualifiers, apply_flags
 
-# Gmail 解析模块(OAuth + LLM 抽取),见 gmail_alerts.py
+# Gmail 解析模块(OAuth + LLM 抽取),见 sources/gmail_alerts.py
 try:
-    from gmail_alerts import fetch_gmail_alerts
+    from sources.gmail_alerts import fetch_gmail_alerts
 except Exception as _e:
     def fetch_gmail_alerts() -> list[dict]:
         logger.warning(f"[gmail] 模块未就绪,跳过: {_e}")

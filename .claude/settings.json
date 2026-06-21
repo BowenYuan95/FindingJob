@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo.)",
+      "Bash(git mv *)",
+      "Bash(py -c \"import pipeline.hard_filter; print\\('pipeline.hard_filter OK'\\)\")",
+      "Bash(py -c \"import pipeline.job_matcher; print\\('pipeline.job_matcher OK'\\)\")",
+      "Bash(py -c \"import pipeline.backfill_scores; print\\('pipeline.backfill_scores OK'\\)\")",
+      "Bash(py -c \"import pipeline; print\\('pipeline package OK'\\)\")",
+      "Bash(py scripts/diagnose.py)",
+      "Bash(py scripts/refresh_flags.py)"
+    ]
+  }
+}

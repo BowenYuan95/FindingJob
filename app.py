@@ -36,7 +36,7 @@ def load_jobs() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM jobs", con)
         con.close()
     except Exception as e:
-        st.error(f"读取 {DB_PATH} 失败:{e}。先跑一次 job_matcher.py。")
+        st.error(f"读取 {DB_PATH} 失败:{e}。先跑一次 pipeline/job_matcher.py。")
         return pd.DataFrame()
     if df.empty:
         return df
@@ -104,7 +104,7 @@ def trigger_backfill():
     import subprocess
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
-        subprocess.Popen(["py", "backfill_scores.py"],
+        subprocess.Popen(["py", "-m", "pipeline.backfill_scores"],
                          creationflags=flags)
     except Exception:
         pass
@@ -137,7 +137,8 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
         bar = st.sidebar.progress(0.0, text="加载模型中…")
         try:
             ensure_models_loaded()          # 确保模型在(上轮可能已卸载)
-            import importlib, job_matcher
+            import importlib
+            from pipeline import job_matcher
             importlib.reload(job_matcher)
             def on_progress(frac, msg):
                 bar.progress(min(max(frac, 0.0), 1.0), text=msg)
@@ -157,7 +158,7 @@ st.sidebar.divider()
 view = st.sidebar.radio("视图", ["📋 待投递", "📊 申请追踪"], label_visibility="collapsed")
 
 if df.empty:
-    st.info("数据库还没数据。先在命令行跑 `python job_matcher.py`,再刷新。")
+    st.info("数据库还没数据。先在命令行跑 `py -m pipeline.job_matcher`,再刷新。")
     st.stop()
 
 

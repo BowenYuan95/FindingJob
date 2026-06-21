@@ -26,8 +26,8 @@ import datetime as dt
 import logging
 
 from config import DB_PATH, PROFILE
-from job_matcher import llm_review, llm_flags_to_objs
-from hard_filter import apply_flags
+from .job_matcher import llm_review, llm_flags_to_objs
+from .hard_filter import apply_flags
 
 logger = logging.getLogger(__name__)
 

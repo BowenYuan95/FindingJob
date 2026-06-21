@@ -47,7 +47,7 @@ def start_backfill() -> None:
         time.sleep(60)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            subprocess.Popen([sys.executable, "backfill_scores.py", "--watch"],
+            subprocess.Popen([sys.executable, "-m", "pipeline.backfill_scores", "--watch"],
                              cwd=HERE, creationflags=flags)
         except Exception as e:
             logger.warning(f"[launcher] backfill failed: {e}")

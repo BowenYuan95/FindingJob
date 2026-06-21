@@ -16,6 +16,7 @@
   - `adjacent`（机器人/传感/人因/通用 SWE）→ ×0.8
   - `out_of_domain`（机械/土木/化工/台架实验/临床心理）→ ×0.5
 - **Streamlit 面板**：双视图——「待投递」排序列表 + 「申请追踪」状态管理；侧边栏实时显示 LLM 打分进度（每条进度 + 职位名）
+- **主界面实时日志**：一键更新期间用 Adzuna/Gmail/embedding/LLM 日志替代旧结果，完成后自动展示最新数据库结果与本轮统计
 - **后台补评**：`pipeline/backfill_scores.py` 在后台持续给还没 LLM 分的职位补评，逐条写库；Streamlit 侧边栏每 8 秒自动刷新显示剩余计数与进度条
 - **桌面窗口**：`launcher.py` 用 pywebview 打开原生桌面窗口，无需浏览器
 

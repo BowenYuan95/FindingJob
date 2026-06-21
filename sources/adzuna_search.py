@@ -62,6 +62,7 @@ def fetch_adzuna() -> list[dict]:
     raw_count = 0
 
     for search in SEARCHES:
+        logger.info(f"[adzuna] 搜索: {search.get('what', search)}")
         for page in range(1, ADZUNA_PAGES + 1):
             url = f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/{page}"
             params = {
@@ -82,6 +83,7 @@ def fetch_adzuna() -> list[dict]:
                 break
 
             results = data.get("results", [])
+            logger.info(f"[adzuna]   第 {page} 页: {len(results)} 条")
             if not results:
                 break
             raw_count += len(results)

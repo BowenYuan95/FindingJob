@@ -14,8 +14,10 @@ app.py — 求职匹配 + 申请追踪 Streamlit 面板
 import os
 import sys
 import json
+import logging
 import webbrowser
 import datetime as dt
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +32,18 @@ from pipeline.job_urls import normalize_job_url
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
 
 st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", layout="wide")
+
+
+class _StreamlitLogHandler(logging.Handler):
+    def __init__(self, callback):
+        super().__init__(logging.INFO)
+        self.callback = callback
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.callback(self.format(record))
+        except Exception:
+            self.handleError(record)
 
 
 # ----------------------------------------------------------------
@@ -196,6 +210,7 @@ def _backfill_progress_panel() -> None:
 # 侧栏:一键更新 + 视图切换
 # ----------------------------------------------------------------
 
+run_surface = st.empty()
 df = load_jobs()
 _expired = purge_expired_deadlines()
 if _expired:
@@ -213,13 +228,32 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
         bar = st.sidebar.progress(0.0, text="加载模型中…")
         llm_label = st.sidebar.empty()
         llm_bar2  = st.sidebar.empty()
+        log_lines: deque[str] = deque(maxlen=250)
+        with run_surface.container():
+            st.subheader("🔄 正在抓取和匹配")
+            st.caption("运行期间暂时隐藏数据库结果；完成后自动显示最新结果。")
+            main_progress = st.progress(0.0, text="准备运行…")
+            log_box = st.empty()
+
+        def append_log(message: str) -> None:
+            log_lines.append(message)
+            log_box.code("\n".join(log_lines), language=None)
+
+        handler = _StreamlitLogHandler(append_log)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        failed = False
         try:
+            append_log("正在加载 embedding 与 LLM 模型…")
             ensure_models_loaded()          # 确保模型在(上轮可能已卸载)
             import importlib
             from pipeline import job_matcher
             importlib.reload(job_matcher)
             def on_progress(frac: float, msg: str) -> None:
                 bar.progress(min(max(frac, 0.0), 1.0), text=msg)
+                main_progress.progress(min(max(frac, 0.0), 1.0), text=msg)
                 if msg.startswith("LLM 复评"):
                     try:
                         parts = msg[len("LLM 复评 "):].split(": ", 1)
@@ -235,28 +269,41 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
             job_matcher.main(progress=on_progress)
             st.cache_data.clear()
         except Exception as e:
+            failed = True
+            append_log(f"运行失败: {e}")
+            run_surface.error(f"运行失败: {e}")
             st.sidebar.error(f"运行失败:{e}")
         else:
-            after = len(load_jobs())
+            latest = load_jobs()
+            after = len(latest)
             bar.empty()
             llm_label.empty()
             llm_bar2.empty()
             trigger_backfill()              # 后台评剩余,评完自动卸载模型
             unscored_now, _ = backfill_status()
             st.session_state["backfill_initial"] = unscored_now
+            states = latest.get("pipeline_state", pd.Series(dtype=str)).value_counts()
+            st.session_state["last_run_summary"] = (
+                f"本轮新增 {max(0, after - before)} 条；"
+                f"待 LLM 补评 {unscored_now} 条；"
+                f"已评分 {int(states.get('SCORED', 0))} 条；"
+                f"embedding 淘汰 {int(states.get('EMBEDDING_REJECTED', 0))} 条。"
+            )
             st.sidebar.success(f"完成!新增 {max(0, after - before)} 条。"
                                f"后台正在补评剩余,完成后会自动卸载模型。")
             st.rerun()
+        finally:
+            root_logger.removeHandler(handler)
+        if failed:
+            bar.empty()
+            llm_label.empty()
+            llm_bar2.empty()
+            st.stop()
 
 with st.sidebar:
     _backfill_progress_panel()
 st.sidebar.divider()
 view = st.sidebar.radio("视图", ["📋 待投递", "📊 申请追踪"], label_visibility="collapsed")
-
-if df.empty:
-    st.info("数据库还没数据。先在命令行跑 `py -m pipeline.job_matcher`,再刷新。")
-    st.stop()
-
 
 # ================================================================
 # 视图一:待投递
@@ -383,7 +430,12 @@ def render_tracker() -> None:
 
 
 # ----------------------------------------------------------------
-if view == "📋 待投递":
-    render_todo()
-else:
-    render_tracker()
+with run_surface.container():
+    if st.session_state.get("last_run_summary"):
+        st.success("✅ 更新完成 · " + st.session_state["last_run_summary"])
+    if df.empty:
+        st.info("数据库还没数据。点击左侧『一键更新』开始抓取。")
+    elif view == "📋 待投递":
+        render_todo()
+    else:
+        render_tracker()

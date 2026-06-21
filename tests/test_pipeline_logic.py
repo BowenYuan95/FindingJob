@@ -1,9 +1,10 @@
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from scripts.refresh_flags import plan_row
 from sources import adzuna_search
 from sources.gmail_alerts import _denoise, _restore_url
 from infrastructure.database import initialize_database
+from infrastructure.job_repository import JobRepository
 from infrastructure.lmstudio import LMStudioClient
 from pipeline.job_urls import normalize_job_url
 
@@ -160,6 +162,86 @@ class PipelineLogicTests(unittest.TestCase):
                 con.close()
             self.assertEqual(mode.lower(), "wal")
             self.assertIn("idx_jobs_source_identity", indexes)
+            self.assertIn("idx_jobs_todo_score", indexes)
+            self.assertIn("idx_jobs_tracker_date", indexes)
+
+    def test_todo_pagination_is_stable_and_bounded(self):
+        con = initialize_database(":memory:")
+        con.executemany(
+            """INSERT INTO jobs(
+                   id,title,company,source,sim,llm_score,status,pipeline_state)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                (f"job-{i:02}", f"Role {i}", "Example", "adzuna", 0.8, None,
+                 "待投", "READY_FOR_LLM")
+                for i in range(45)
+            ],
+        )
+        repo = JobRepository(con)
+
+        total, average = repo.todo_stats(["adzuna"], 0, "", False)
+        first = repo.fetch_todo_page(["adzuna"], 0, "", False, 20, 0)
+        second = repo.fetch_todo_page(["adzuna"], 0, "", False, 20, 20)
+        last = repo.fetch_todo_page(["adzuna"], 0, "", False, 20, 40)
+
+        self.assertEqual((total, average), (45, 80.0))
+        self.assertEqual(len(first), 20)
+        self.assertEqual(len(second), 20)
+        self.assertEqual(len(last), 5)
+        self.assertEqual(first[0]["id"], "job-00")
+        self.assertEqual(second[0]["id"], "job-20")
+        self.assertFalse({r["id"] for r in first} & {r["id"] for r in second})
+        con.close()
+
+    def test_todo_pagination_applies_all_filters(self):
+        con = initialize_database(":memory:")
+        con.executemany(
+            """INSERT INTO jobs(
+                   id,title,company,source,sim,llm_score,status,pipeline_state)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                ("1", "ML Researcher", "Alpha", "adzuna", 0.7, 90,
+                 "待投", "SCORED"),
+                ("2", "Data Scientist", "Alpha", "adzuna", 0.8, None,
+                 "待投", "READY_FOR_LLM"),
+                ("3", "ML Engineer", "Beta", "gmail", 0.95, 95,
+                 "待投", "SCORED"),
+                ("4", "ML Researcher", "Alpha", "adzuna", 0.99, 99,
+                 "DISQUALIFIED", "DISQUALIFIED"),
+            ],
+        )
+        repo = JobRepository(con)
+
+        total, average = repo.todo_stats(["adzuna"], 85, "research", True)
+        rows = repo.fetch_todo_page(["adzuna"], 85, "research", True, 20, 0)
+
+        self.assertEqual((total, average), (1, 90.0))
+        self.assertEqual([row["id"] for row in rows], ["1"])
+        self.assertEqual(repo.todo_stats([], 0, "", False)[0], 0)
+        con.close()
+
+    def test_tracker_pagination_and_counts(self):
+        con = initialize_database(":memory:")
+        con.executemany(
+            """INSERT INTO jobs(id,title,status,applied_date)
+               VALUES (?,?,?,?)""",
+            [
+                (f"applied-{i:02}", f"Role {i}", "已投", f"2026-06-{i + 1:02}")
+                for i in range(25)
+            ] + [("interview", "Interview", "面试", "2026-07-01")],
+        )
+        repo = JobRepository(con)
+
+        counts = repo.tracker_status_counts(["已投", "面试", "拒", "offer"])
+        second = repo.fetch_tracker_page(["已投"], 20, 20)
+
+        self.assertEqual(counts, {"已投": 25, "面试": 1})
+        self.assertEqual(repo.count_tracker(["已投"]), 25)
+        self.assertEqual(len(second), 5)
+        self.assertEqual(second[-1]["id"], "applied-00")
+        self.assertEqual(repo.count_tracker([]), 0)
+        self.assertEqual(repo.fetch_tracker_page([], 20, 0), [])
+        con.close()
 
     @patch("infrastructure.lmstudio.time.sleep")
     @patch("infrastructure.lmstudio.requests.post")
@@ -221,6 +303,28 @@ class PipelineLogicTests(unittest.TestCase):
         self.assertEqual(score, 5)
         self.assertEqual(status, "DISQUALIFIED")
         con.close()
+
+    @patch("pipeline.backfill_scores.subprocess.run")
+    @patch.object(backfill_scores.LM_CLIENT, "loaded_models")
+    def test_backfill_does_not_load_when_api_is_unreachable(self, loaded_models, run):
+        loaded_models.side_effect = OSError("server unavailable")
+
+        self.assertEqual(backfill_scores.ensure_llm_loaded(), (False, False))
+        run.assert_not_called()
+
+    @patch("pipeline.backfill_scores.ensure_llm_loaded")
+    @patch("pipeline.backfill_scores.pending_count", return_value=0)
+    @patch("pipeline.backfill_scores.acquire_single_instance")
+    def test_backfill_with_empty_queue_does_not_wake_model(
+        self, acquire_lock, _pending_count, ensure_loaded,
+    ):
+        lock = MagicMock()
+        acquire_lock.return_value = lock
+        with patch.object(sys, "argv", ["backfill_scores"]):
+            backfill_scores.main()
+
+        ensure_loaded.assert_not_called()
+        lock.close.assert_called_once()
 
     def test_failed_job_is_skipped_for_current_run(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -18,18 +18,18 @@ import logging
 import webbrowser
 import datetime as dt
 from collections import deque
-from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 from config import DB_PATH
-from infrastructure.database import database_session, initialize_database
+from infrastructure.database import database_session
 from infrastructure.job_repository import JobRepository
 from infrastructure.lmstudio import LM_CLIENT
 from pipeline.job_urls import normalize_job_url
 
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
+TRACKED_STATUSES = [s for s in STATUSES if s != "待投"]
+PAGE_SIZE = 20
 
 st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", layout="wide")
 
@@ -50,29 +50,51 @@ class _StreamlitLogHandler(logging.Handler):
 # 数据
 # ----------------------------------------------------------------
 
-@st.cache_data(ttl=60)
-def load_jobs() -> pd.DataFrame:
+def dashboard_snapshot() -> dict[str, object]:
     try:
-        con = initialize_database(DB_PATH)
-        df = pd.DataFrame.from_records(JobRepository(con).fetch_all())
-        con.close()
+        with database_session(DB_PATH, initialize=True) as con:
+            repo = JobRepository(con)
+            return {
+                "total": repo.total_jobs(),
+                "pipeline": repo.pipeline_counts(),
+            }
     except Exception as e:
         st.error(f"读取 {DB_PATH} 失败:{e}。先跑一次 pipeline/job_matcher.py。")
-        return pd.DataFrame()
-    if df.empty:
-        return df
-    # 字段兜底(旧库未迁移)
-    for col, default in [("applied", 0), ("summary", ""), ("status", "待投"),
-                         ("applied_date", ""), ("note", ""),
-                         ("score_status", ""), ("applied_cap", None)]:
-        if col not in df.columns:
-            df[col] = default
-    df["status"] = df["status"].fillna("待投").replace("", "待投")
-    df["score"] = df.apply(
-        lambda r: r["llm_score"] if pd.notna(r["llm_score"]) else (r["sim"] or 0) * 100,
-        axis=1).round(0)
-    df["has_llm"] = df["llm_score"].notna()
-    return df.sort_values("score", ascending=False)
+        return {"total": 0, "pipeline": {}}
+
+
+def page_window(
+    state_key: str, filter_signature: tuple[object, ...], total: int,
+) -> tuple[int, int]:
+    """Reset on filter changes and clamp after rows move off the current page."""
+    signature_key = f"{state_key}_filters"
+    if st.session_state.get(signature_key) != filter_signature:
+        st.session_state[signature_key] = filter_signature
+        st.session_state[state_key] = 1
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(max(int(st.session_state.get(state_key, 1)), 1), total_pages)
+    st.session_state[state_key] = page
+    return page, total_pages
+
+
+def render_pagination(state_key: str, page: int, total_pages: int) -> None:
+    previous, label, following = st.columns([0.25, 0.5, 0.25])
+    if previous.button(
+        "← 上一页", key=f"{state_key}_previous", disabled=page <= 1,
+        use_container_width=True,
+    ):
+        st.session_state[state_key] = page - 1
+        st.rerun()
+    label.markdown(
+        f"<div style='text-align:center'>第 {page} / {total_pages} 页</div>",
+        unsafe_allow_html=True,
+    )
+    if following.button(
+        "下一页 →", key=f"{state_key}_next", disabled=page >= total_pages,
+        use_container_width=True,
+    ):
+        st.session_state[state_key] = page + 1
+        st.rerun()
 
 
 def purge_expired_deadlines() -> int:
@@ -81,25 +103,33 @@ def purge_expired_deadlines() -> int:
     try:
         with database_session(DB_PATH) as con:
             repo = JobRepository(con)
-            rows = repo.pending_deadline_candidates()
             updated = 0
-            for jid, title, desc, flags_json in rows:
-                rescanned = scan_disqualifiers(title or "", desc or "")
-                dl = next((f for f in rescanned if f["code"] == "deadline_passed"), None)
-                if not dl:
-                    continue
-                try:
-                    old_flags = json.loads(flags_json) if flags_json else []
-                except (TypeError, json.JSONDecodeError):
-                    old_flags = []
-                flags = dedup_flags(old_flags + [dl])
-                repo.mark_deadline_disqualified(
-                    jid,
-                    f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
-                    json.dumps(flags, ensure_ascii=False),
-                    dt.datetime.now().isoformat(timespec="seconds"),
-                )
-                updated += 1
+            after_id = ""
+            while True:
+                rows = repo.pending_deadline_candidates(after_id, limit=100)
+                if not rows:
+                    break
+                for jid, title, desc, flags_json in rows:
+                    rescanned = scan_disqualifiers(title or "", desc or "")
+                    dl = next(
+                        (f for f in rescanned if f["code"] == "deadline_passed"),
+                        None,
+                    )
+                    if not dl:
+                        continue
+                    try:
+                        old_flags = json.loads(flags_json) if flags_json else []
+                    except (TypeError, json.JSONDecodeError):
+                        old_flags = []
+                    flags = dedup_flags(old_flags + [dl])
+                    repo.mark_deadline_disqualified(
+                        jid,
+                        f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
+                        json.dumps(flags, ensure_ascii=False),
+                        dt.datetime.now().isoformat(timespec="seconds"),
+                    )
+                    updated += 1
+                after_id = rows[-1][0]
         return updated
     except Exception as e:
         st.warning(f"截止日期清理失败:{e}")
@@ -113,7 +143,6 @@ def update_job(job_id: str, **fields: object) -> None:
     try:
         with database_session(DB_PATH) as con:
             JobRepository(con).update_user_fields(job_id, fields)
-        st.cache_data.clear()
     except Exception as e:
         st.error(f"更新失败:{e}")
 
@@ -124,7 +153,6 @@ def manually_disqualify(job_id: str) -> None:
             JobRepository(con).mark_manually_disqualified(
                 job_id, dt.datetime.now().isoformat(timespec="seconds")
             )
-        st.cache_data.clear()
     except Exception as e:
         st.error(f"淘汰失败：{e}")
 
@@ -154,23 +182,30 @@ def lmstudio_alive() -> bool:
 
 
 def ensure_models_loaded():
-    """点更新前确保两个模型已加载(上轮可能被 backfill 卸载了)。"""
+    """点更新前只加载当前确实缺失的模型。"""
     import subprocess
-    cmds = [
-        ["lms", "load", "text-embedding-nomic-embed-text-v1.5", "--gpu", "max"],
-        ["lms", "load", "qwen/qwen3.5-9b", "--gpu", "max", "--context-length", "16384"],
-    ]
-    for c in cmds:
+    loaded = LM_CLIENT.loaded_models(timeout=5)
+    cmds = {
+        "text-embedding-nomic-embed-text-v1.5":
+            ["lms", "load", "text-embedding-nomic-embed-text-v1.5",
+             "--identifier", "text-embedding-nomic-embed-text-v1.5", "--gpu", "max"],
+        "qwen/qwen3.5-9b":
+            ["lms", "load", "qwen/qwen3.5-9b", "--identifier", "qwen/qwen3.5-9b",
+             "--gpu", "max", "--context-length", "16384"],
+    }
+    for model, c in cmds.items():
+        if model in loaded:
+            continue
         try:
             result = subprocess.run(c, capture_output=True, text=True, timeout=120)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         except Exception as e:
-            raise RuntimeError(f"模型加载失败 ({c[2]}): {e}") from e
+            raise RuntimeError(f"模型加载失败 ({model}): {e}") from e
 
 
 def trigger_backfill():
-    """后台启动 backfill:评完剩余 + 卸载模型(不阻塞面板)。"""
+    """后台启动 backfill:补评剩余职位(不阻塞面板)。"""
     import subprocess
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
@@ -222,11 +257,10 @@ def _backfill_progress_panel() -> None:
 # ----------------------------------------------------------------
 
 run_surface = st.empty()
-df = load_jobs()
+snapshot = dashboard_snapshot()
 _expired = purge_expired_deadlines()
 if _expired:
-    st.cache_data.clear()
-    df = load_jobs()
+    snapshot = dashboard_snapshot()
 
 st.sidebar.title("🎯 求职面板")
 st.sidebar.caption(f"上次更新:{last_update_time()}")
@@ -235,7 +269,7 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
     if not lmstudio_alive():
         st.sidebar.error("LM Studio 没连上(localhost:1234)。先 Start Server 再更新。")
     else:
-        before = len(df)
+        before = int(snapshot["total"])
         bar = st.sidebar.progress(0.0, text="加载模型中…")
         llm_label = st.sidebar.empty()
         llm_bar2  = st.sidebar.empty()
@@ -278,22 +312,22 @@ if st.sidebar.button("🔄 一键更新(抓取 + 匹配)", use_container_width=T
                     llm_label.empty()
                     llm_bar2.empty()
             job_matcher.main(progress=on_progress)
-            st.cache_data.clear()
         except Exception as e:
             failed = True
             append_log(f"运行失败: {e}")
             run_surface.error(f"运行失败: {e}")
             st.sidebar.error(f"运行失败:{e}")
         else:
-            latest = load_jobs()
-            after = len(latest)
+            latest = dashboard_snapshot()
+            after = int(latest["total"])
             bar.empty()
             llm_label.empty()
             llm_bar2.empty()
             trigger_backfill()              # 后台评剩余,评完自动卸载模型
             unscored_now, _ = backfill_status()
             st.session_state["backfill_initial"] = unscored_now
-            states = latest.get("pipeline_state", pd.Series(dtype=str)).value_counts()
+            states_value = latest["pipeline"]
+            states = states_value if isinstance(states_value, dict) else {}
             st.session_state["last_run_summary"] = (
                 f"本轮新增 {max(0, after - before)} 条；"
                 f"待 LLM 补评 {unscored_now} 条；"
@@ -321,31 +355,41 @@ view = st.sidebar.radio("视图", ["📋 待投递", "📊 申请追踪"], label
 # ================================================================
 
 def render_todo() -> None:
-    sources = sorted(df["source"].dropna().unique().tolist())
+    try:
+        with database_session(DB_PATH) as con:
+            sources = JobRepository(con).sources()
+    except Exception as e:
+        st.error(f"读取职位来源失败:{e}")
+        return
     pick_src   = st.sidebar.multiselect("来源", sources, default=sources)
     min_score  = st.sidebar.slider("最低分数", 0, 100, 0, step=5)
     kw         = st.sidebar.text_input("关键词(标题/公司)", "").strip().lower()
     only_llm   = st.sidebar.checkbox("只看 LLM 复评过的", value=False)
 
-    visible_states = ["READY_FOR_LLM", "SCORED"]
-    v = df[(df["status"] == "待投") & df["pipeline_state"].isin(visible_states) &
-           df["source"].isin(pick_src) & (df["score"] >= min_score)]
-    if kw:
-        v = v[v["title"].str.lower().str.contains(kw, na=False) |
-              v["company"].str.lower().str.contains(kw, na=False)]
-    if only_llm:
-        v = v[v["has_llm"]]
+    filters = (tuple(pick_src), min_score, kw, only_llm)
+    try:
+        with database_session(DB_PATH) as con:
+            repo = JobRepository(con)
+            total, average = repo.todo_stats(pick_src, min_score, kw, only_llm)
+            page, total_pages = page_window("todo_page", filters, total)
+            rows = repo.fetch_todo_page(
+                pick_src, min_score, kw, only_llm,
+                PAGE_SIZE, (page - 1) * PAGE_SIZE,
+            )
+    except Exception as e:
+        st.error(f"读取待投职位失败:{e}")
+        return
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("待投职位", len(v))
-    c2.metric("数据库总数", len(df))
-    c3.metric("平均分", f"{v['score'].mean():.0f}" if len(v) else "—")
+    c1.metric("待投职位", total)
+    c2.metric("数据库总数", int(snapshot["total"]))
+    c3.metric("平均分", f"{average:.0f}" if average is not None else "—")
     st.divider()
 
-    if v.empty:
+    if not rows:
         st.warning("当前筛选下没有待投职位。"); return
 
-    for _, r in v.iterrows():
+    for r in rows:
         tag = "🧠" if r["has_llm"] else "📐"
         with st.container(border=True):
             top = st.columns([0.8, 0.2])
@@ -358,7 +402,7 @@ def render_todo() -> None:
                 st.markdown(f"> {r['llm_reason']}")
             if r.get("score_status") == "capped":
                 cap = r.get("applied_cap")
-                st.caption(f"⚠ 系统封顶: {cap:.0f}" if pd.notna(cap) else "⚠ 系统封顶")
+                st.caption(f"⚠ 系统封顶: {cap:.0f}" if cap is not None else "⚠ 系统封顶")
 
             bcol = st.columns([0.3, 0.38, 0.15, 0.17])
             job_url = normalize_job_url(r.get("url"))
@@ -384,6 +428,7 @@ def render_todo() -> None:
                 with st.expander("职位描述"):
                     st.write(r["description"][:1500])
 
+    render_pagination("todo_page", page, total_pages)
     st.caption("🧠 = Qwen 复评分 · 📐 = embedding 相似度分")
 
 
@@ -392,26 +437,44 @@ def render_todo() -> None:
 # ================================================================
 
 def render_tracker() -> None:
-    tracked = df[df["status"].isin([s for s in STATUSES if s != "待投"])].copy()
+    try:
+        with database_session(DB_PATH) as con:
+            overall_counts = JobRepository(con).tracker_status_counts(TRACKED_STATUSES)
+    except Exception as e:
+        st.error(f"读取申请追踪统计失败:{e}")
+        return
+    overall_total = sum(overall_counts.values())
 
     # 顶部:各状态统计
-    cols = st.columns(len(STATUSES) - 1 + 1)
-    cols[0].metric("追踪总数", len(tracked))
-    for i, sname in enumerate([s for s in STATUSES if s != "待投"], 1):
-        cols[i].metric(sname, int((tracked["status"] == sname).sum()))
+    cols = st.columns(len(TRACKED_STATUSES) + 1)
+    cols[0].metric("追踪总数", overall_total)
+    for i, sname in enumerate(TRACKED_STATUSES, 1):
+        cols[i].metric(sname, overall_counts.get(sname, 0))
     st.divider()
 
-    if tracked.empty:
+    if overall_total == 0:
         st.info("还没有已处理的职位。去『待投递』里把投过的职位改个状态,就会出现在这里。")
         return
 
     # 状态筛选
-    pick = st.multiselect("筛选状态", [s for s in STATUSES if s != "待投"],
-                          default=[s for s in STATUSES if s != "待投"])
-    tracked = tracked[tracked["status"].isin(pick)]
-    tracked = tracked.sort_values("applied_date", ascending=False)
+    pick = st.multiselect("筛选状态", TRACKED_STATUSES, default=TRACKED_STATUSES)
+    try:
+        with database_session(DB_PATH) as con:
+            repo = JobRepository(con)
+            total = repo.count_tracker(pick)
+            page, total_pages = page_window("tracker_page", (tuple(pick),), total)
+            rows = repo.fetch_tracker_page(
+                pick, PAGE_SIZE, (page - 1) * PAGE_SIZE,
+            )
+    except Exception as e:
+        st.error(f"读取申请追踪职位失败:{e}")
+        return
 
-    for _, r in tracked.iterrows():
+    if not rows:
+        st.warning("当前筛选下没有申请记录。")
+        return
+
+    for r in rows:
         with st.container(border=True):
             head = st.columns([0.6, 0.4])
             head[0].markdown(f"### {r['title']}")
@@ -441,12 +504,14 @@ def render_tracker() -> None:
             if note != (r.get("note", "") or ""):
                 update_job(r["id"], note=note); st.rerun()
 
+    render_pagination("tracker_page", page, total_pages)
+
 
 # ----------------------------------------------------------------
 with run_surface.container():
     if st.session_state.get("last_run_summary"):
         st.success("✅ 更新完成 · " + st.session_state["last_run_summary"])
-    if df.empty:
+    if int(snapshot["total"]) == 0:
         st.info("数据库还没数据。点击左侧『一键更新』开始抓取。")
     elif view == "📋 待投递":
         render_todo()

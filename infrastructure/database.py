@@ -185,5 +185,18 @@ def initialize_database(path: str = DB_PATH) -> sqlite3.Connection:
         ON jobs(pipeline_state, status, llm_score, sim DESC)
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_todo_score
+        ON jobs(
+            status,
+            pipeline_state,
+            COALESCE(llm_score, COALESCE(sim, 0) * 100.0) DESC,
+            id
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_tracker_date
+        ON jobs(status, applied_date DESC, id)
+    """)
     con.commit()
     return con

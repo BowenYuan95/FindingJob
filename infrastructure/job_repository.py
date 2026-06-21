@@ -7,6 +7,7 @@ from typing import Any
 
 class JobRepository:
     USER_EDITABLE_FIELDS = {"status", "applied", "applied_date", "note"}
+    SCORE_SQL = "COALESCE(llm_score, COALESCE(sim, 0) * 100.0)"
 
     def __init__(self, connection: sqlite3.Connection):
         self.con = connection
@@ -59,8 +60,138 @@ class JobRepository:
 
     def fetch_all(self) -> list[dict[str, Any]]:
         cursor = self.con.execute("SELECT * FROM jobs")
+        return self._dict_rows(cursor)
+
+    @staticmethod
+    def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
         columns = [item[0] for item in cursor.description]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _like_value(value: str) -> str:
+        return "%" + value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    def total_jobs(self) -> int:
+        return int(self.con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+
+    def sources(self) -> list[str]:
+        return [
+            row[0] for row in self.con.execute(
+                """SELECT DISTINCT source FROM jobs
+                   WHERE source IS NOT NULL AND TRIM(source) != ''
+                   ORDER BY source"""
+            ).fetchall()
+        ]
+
+    def pipeline_counts(self) -> dict[str, int]:
+        return {
+            str(state or ""): int(count)
+            for state, count in self.con.execute(
+                "SELECT pipeline_state, COUNT(*) FROM jobs GROUP BY pipeline_state"
+            ).fetchall()
+        }
+
+    def _todo_filter(
+        self,
+        sources: list[str],
+        min_score: int,
+        keyword: str,
+        only_llm: bool,
+    ) -> tuple[str, list[object]]:
+        where = [
+            "status='待投'",
+            "pipeline_state IN ('READY_FOR_LLM', 'SCORED')",
+            f"{self.SCORE_SQL} >= ?",
+        ]
+        params: list[object] = [min_score]
+        if sources:
+            where.append(f"source IN ({','.join('?' for _ in sources)})")
+            params.extend(sources)
+        else:
+            where.append("0")
+        if keyword:
+            where.append(
+                "(LOWER(COALESCE(title,'')) LIKE ? ESCAPE '\\' "
+                "OR LOWER(COALESCE(company,'')) LIKE ? ESCAPE '\\')"
+            )
+            value = self._like_value(keyword.lower())
+            params.extend([value, value])
+        if only_llm:
+            where.append("llm_score IS NOT NULL")
+        return " AND ".join(where), params
+
+    def todo_stats(
+        self,
+        sources: list[str],
+        min_score: int,
+        keyword: str,
+        only_llm: bool,
+    ) -> tuple[int, float | None]:
+        where, params = self._todo_filter(sources, min_score, keyword, only_llm)
+        row = self.con.execute(
+            f"""SELECT COUNT(*), AVG(ROUND({self.SCORE_SQL}, 0))
+                FROM jobs WHERE {where}""",
+            params,
+        ).fetchone()
+        return int(row[0]), (float(row[1]) if row[1] is not None else None)
+
+    def fetch_todo_page(
+        self,
+        sources: list[str],
+        min_score: int,
+        keyword: str,
+        only_llm: bool,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        where, params = self._todo_filter(sources, min_score, keyword, only_llm)
+        cursor = self.con.execute(
+            f"""SELECT *, ROUND({self.SCORE_SQL}, 0) AS score,
+                       (llm_score IS NOT NULL) AS has_llm
+                FROM jobs
+                WHERE {where}
+                ORDER BY {self.SCORE_SQL} DESC, id ASC
+                LIMIT ? OFFSET ?""",
+            [*params, limit, offset],
+        )
+        return self._dict_rows(cursor)
+
+    def tracker_status_counts(self, statuses: list[str]) -> dict[str, int]:
+        if not statuses:
+            return {}
+        placeholders = ",".join("?" for _ in statuses)
+        return {
+            str(status): int(count)
+            for status, count in self.con.execute(
+                f"""SELECT status, COUNT(*) FROM jobs
+                    WHERE status IN ({placeholders}) GROUP BY status""",
+                statuses,
+            ).fetchall()
+        }
+
+    def count_tracker(self, statuses: list[str]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        return int(self.con.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE status IN ({placeholders})",
+            statuses,
+        ).fetchone()[0])
+
+    def fetch_tracker_page(
+        self, statuses: list[str], limit: int, offset: int,
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        cursor = self.con.execute(
+            f"""SELECT * FROM jobs
+                WHERE status IN ({placeholders})
+                ORDER BY COALESCE(applied_date, '') DESC, id ASC
+                LIMIT ? OFFSET ?""",
+            [*statuses, limit, offset],
+        )
+        return self._dict_rows(cursor)
 
     def update_user_fields(self, job_id: str, fields: dict[str, Any]) -> None:
         unknown = set(fields) - self.USER_EDITABLE_FIELDS
@@ -80,9 +211,13 @@ class JobRepository:
         ).fetchone()
         return row[0] if row and row[0] else ""
 
-    def pending_deadline_candidates(self) -> list[tuple]:
+    def pending_deadline_candidates(
+        self, after_id: str = "", limit: int = 100,
+    ) -> list[tuple]:
         return self.con.execute(
-            "SELECT id, title, description, flags FROM jobs WHERE status='待投'"
+            """SELECT id, title, description, flags FROM jobs
+               WHERE status='待投' AND id > ? ORDER BY id LIMIT ?""",
+            (after_id, limit),
         ).fetchall()
 
     def mark_deadline_disqualified(

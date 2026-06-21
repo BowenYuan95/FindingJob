@@ -43,7 +43,6 @@ SEARCHES = [
     {"what": "AI engineer"},
     {"what": "machine learning engineer"},
     {"what": "machine learning"},
-    {"what": "computer vision"},
     {"what": "applied scientist"},
     {"what": "large language model"},
     {"what": "generative AI"},

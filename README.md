@@ -10,9 +10,13 @@
 - **三层精排**：
   1. **硬性淘汰**（`pipeline/hard_filter.py`）：安全许可、AHPRA 注册要求、排他性公民身份、截止已过、湿实验室、临床交付等
   2. **语义初筛**：Nomic Embed Text 向量余弦相似度（阈值 0.60）+ 级别降权
-  3. **LLM 复评**：Qwen3.5-9B 对 top-50 逐条打分（0-100）+ 输出摘要 + 自检 flags
-- **Streamlit 面板**：双视图——「待投递」排序列表 + 「申请追踪」状态管理
-- **后台补评**：`pipeline/backfill_scores.py` 在后台持续给还没 LLM 分的职位补评，逐条写库，面板实时可见
+  3. **LLM 复评**：Qwen3.5-9B 对 top-50 逐条打分（0-100）+ 输出摘要 + 自检 flags + **学科乘数**
+- **学科乘数**：LLM 把每岗核心学科分为三类，Python 乘以对应系数后再送 `apply_flags` 封顶：
+  - `in_domain`（CS/HCI/XR/HRI/ML-AI/数字健康）→ ×1.0
+  - `adjacent`（机器人/传感/人因/通用 SWE）→ ×0.8
+  - `out_of_domain`（机械/土木/化工/台架实验/临床心理）→ ×0.5
+- **Streamlit 面板**：双视图——「待投递」排序列表 + 「申请追踪」状态管理；侧边栏实时显示 LLM 打分进度（每条进度 + 职位名）
+- **后台补评**：`pipeline/backfill_scores.py` 在后台持续给还没 LLM 分的职位补评，逐条写库；Streamlit 侧边栏每 8 秒自动刷新显示剩余计数与进度条
 - **桌面窗口**：`launcher.py` 用 pywebview 打开原生桌面窗口，无需浏览器
 
 ---
@@ -118,6 +122,7 @@ FindingJob/
 | `PROFILE` | *(见 config.py)* | 候选人画像，LLM 打分的核心依据，按需修改 |
 | `SEARCHES` | *(见 config.py)* | Adzuna 搜索词列表 |
 | `LLM_FLAG_CAPS` | *(见 config.py)* | LLM 自检 flag 对应的分数封顶值 |
+| `LMSTUDIO_BASE` | `http://localhost:1234/v1` | LM Studio API 端点 |
 
 ---
 
@@ -154,7 +159,7 @@ FindingJob/
 | `sim` | Nomic embedding 余弦相似度（0-1） |
 | `llm_score` | Qwen 打分（0-100）；NULL = 待 backfill |
 | `llm_reason` | 一句话中文理由 |
-| `flags` | JSON 数组，每项含 code / label / cap / severity / evidence |
+| `flags` | JSON 数组，每项含 code / label / cap / severity / evidence；含 `discipline` 条目记录学科乘数 |
 | `status` | 待投 / 已投 / 面试 / 拒 / offer / DISQUALIFIED |
 | `summary` | LLM 生成的要点摘要（职责 / 要求 / 待遇） |
 | `note` | 用户自填备注（面试时间、联系人等） |

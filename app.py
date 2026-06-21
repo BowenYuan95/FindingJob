@@ -54,6 +54,32 @@ def load_jobs() -> pd.DataFrame:
     return df.sort_values("score", ascending=False)
 
 
+def purge_expired_deadlines() -> int:
+    """Re-scan deadline flags on all 待投 jobs; mark newly expired ones DISQUALIFIED."""
+    from pipeline.hard_filter import scan_disqualifiers
+    try:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT id, title, description FROM jobs WHERE status='待投'"
+        ).fetchall()
+        updated = 0
+        for jid, title, desc in rows:
+            flags = scan_disqualifiers(title or "", desc or "")
+            dl = next((f for f in flags if f["code"] == "deadline_passed"), None)
+            if dl:
+                con.execute(
+                    "UPDATE jobs SET status='DISQUALIFIED', llm_reason=? WHERE id=?",
+                    (f"硬性淘汰:截止已过 {dl['evidence'][:80]}", jid),
+                )
+                updated += 1
+        if updated:
+            con.commit()
+        con.close()
+        return updated
+    except Exception:
+        return 0
+
+
 def update_job(job_id: str, **fields: object) -> None:
     """更新某职位的 status / note 等字段。"""
     if not fields:
@@ -160,6 +186,10 @@ def _backfill_progress_panel() -> None:
 # ----------------------------------------------------------------
 
 df = load_jobs()
+_expired = purge_expired_deadlines()
+if _expired:
+    st.cache_data.clear()
+    df = load_jobs()
 
 st.sidebar.title("🎯 求职面板")
 st.sidebar.caption(f"上次更新:{last_update_time()}")

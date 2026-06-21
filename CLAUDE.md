@@ -12,6 +12,8 @@
 
 数据库连接、迁移、WAL 与索引统一由 `infrastructure/database.py` 管理。采集结果必须全部
 入库并通过 `pipeline_state` 表达处理结果；不要重新引入“embedding 未过即静默丢弃”的逻辑。
+业务编排不得新增裸 SQL 或直接 `requests` 调用；职位存取走 `JobRepository`，模型调用走
+`infrastructure/lmstudio.py`。
 
 存量维护:`refresh_flags.py` 对数据库重跑 hard_filter 刷新 flags,**不重抓 Adzuna**。
 

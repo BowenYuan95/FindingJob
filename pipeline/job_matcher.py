@@ -26,11 +26,13 @@ import datetime as dt
 import logging
 from typing import Any
 
-import requests
 import numpy as np
 from numpy.typing import NDArray
 
 from infrastructure.database import initialize_database
+from infrastructure.job_repository import JobRepository
+from infrastructure.lmstudio import LM_CLIENT
+from .job_urls import normalize_job_url
 
 from config import (
     ADZUNA_APP_ID, ADZUNA_APP_KEY,
@@ -82,31 +84,20 @@ def _semantic_key(job: dict) -> tuple[str, str, str]:
     )
 
 
-def find_existing_job(con: sqlite3.Connection, job: dict) -> str | None:
+def find_existing_job(repo: JobRepository, job: dict) -> str | None:
     """Find native-ID or legacy title/company records without duplicating old DB rows."""
     source = str(job.get("source") or "")
     source_id = str(job.get("source_id") or "")
-    if source and source_id:
-        row = con.execute(
-            "SELECT id FROM jobs WHERE source=? AND source_id=?",
-            (source, source_id),
-        ).fetchone()
-        if row:
-            return row[0]
-
-        # One-time compatibility bridge for rows created before source_id existed.
-        legacy_id = job_hash(job.get("title", ""), job.get("company", ""))
-        row = con.execute(
-            "SELECT id FROM jobs WHERE id=? AND source=? AND COALESCE(source_id,'')=''",
-            (legacy_id, source),
-        ).fetchone()
-        if row:
-            con.execute("UPDATE jobs SET source_id=? WHERE id=?", (source_id, row[0]))
-            return row[0]
-
-    jid = job_hash(job.get("title", ""), job.get("company", ""), source, source_id)
-    row = con.execute("SELECT id FROM jobs WHERE id=?", (jid,)).fetchone()
-    return row[0] if row else None
+    canonical_id = job_hash(
+        job.get("title", ""), job.get("company", ""), source, source_id
+    )
+    legacy_id = job_hash(job.get("title", ""), job.get("company", ""))
+    return repo.find_existing(
+        source=source,
+        source_id=source_id,
+        canonical_id=canonical_id,
+        legacy_id=legacy_id,
+    )
 
 
 # ============================================================
@@ -144,9 +135,7 @@ def validate_runtime() -> tuple[list[str], list[str]]:
         required_models.add(LLM_MODEL)
     if required_models:
         try:
-            response = requests.get(f"{LMSTUDIO_BASE}/models", timeout=5)
-            response.raise_for_status()
-            loaded = {item.get("id") for item in response.json().get("data", [])}
+            loaded = LM_CLIENT.loaded_models(timeout=5)
             missing = sorted(required_models - loaded)
             if missing:
                 errors.append("LM Studio 模型未加载: " + ", ".join(missing))
@@ -161,25 +150,8 @@ def validate_runtime() -> tuple[list[str], list[str]]:
 # ============================================================
 
 def embed_batch(texts: list[str]) -> list[NDArray[np.float32]]:
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            r = requests.post(
-                f"{LMSTUDIO_BASE}/embeddings",
-                json={"model": EMBED_MODEL, "input": [t[:6000] for t in texts]},
-                timeout=120,
-            )
-            r.raise_for_status()
-            data = r.json()["data"]
-            if len(data) != len(texts):
-                raise ValueError(f"embedding count mismatch: {len(data)} != {len(texts)}")
-            return [np.array(d["embedding"], dtype=np.float32) for d in data]
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[embed] 第 {attempt}/3 次调用失败: {e}")
-            if attempt < 3:
-                time.sleep(2 ** (attempt - 1))
-    raise RuntimeError(f"embedding 调用连续失败: {last_error}")
+    vectors = LM_CLIENT.embeddings(texts, EMBED_MODEL)
+    return [np.array(vector, dtype=np.float32) for vector in vectors]
 
 
 def cosine(a: NDArray[np.float32], b: NDArray[np.float32]) -> float:
@@ -281,15 +253,14 @@ def llm_review(
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            r = requests.post(f"{LMSTUDIO_BASE}/chat/completions",
-                              json={"model": LLM_MODEL,
-                                    "messages": [{"role": "system", "content": sys},
-                                                 {"role": "user", "content": prompt}],
-                                    "temperature": 0.2,
-                                    "stream": False},
-                              timeout=240)
-            r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
+            response = LM_CLIENT.chat_completion(
+                model=LLM_MODEL,
+                messages=[{"role": "system", "content": sys},
+                          {"role": "user", "content": prompt}],
+                temperature=0.2,
+                timeout=240,
+            )
+            msg = response["choices"][0]["message"]
             txt = msg.get("content") or msg.get("reasoning_content") or ""
             obj = json.loads(_extract_json(txt))
             sm = obj.get("summary", "")
@@ -333,6 +304,8 @@ def llm_review(
         except Exception as e:
             last_error = e
             logger.warning(f"[llm] 第 {attempt}/3 次调用失败: {e}")
+            if isinstance(e, RuntimeError) and "连续失败" in str(e):
+                break
             if attempt < 3:
                 time.sleep(2 ** (attempt - 1))
     return None, f"(LLM 打分失败,已重试 3 次: {last_error})", "", []
@@ -370,6 +343,7 @@ def main(progress: Any = None) -> None:
         raise RuntimeError("运行环境未就绪:\n- " + "\n- ".join(errors))
 
     con = db_init()
+    repo = JobRepository(con)
     _p(0.05, "正在抓取 Adzuna + Gmail...")
     raw_jobs = fetch_adzuna() + fetch_gmail_alerts()
 
@@ -386,13 +360,17 @@ def main(progress: Any = None) -> None:
         semantic = _semantic_key(j)
         if jid in seen_ids or (not source_id and semantic in seen_semantic):
             continue
-        existing_id = find_existing_job(con, j)
+        existing_id = find_existing_job(repo, j)
         if existing_id:
-            state_row = con.execute(
-                "SELECT pipeline_state FROM jobs WHERE id=?", (existing_id,)
-            ).fetchone()
+            normalized_url = normalize_job_url(j.get("url"))
+            if normalized_url:
+                j["url"] = normalized_url
+                repo.refresh_source_metadata(
+                    existing_id, j, dt.datetime.now().isoformat(timespec="seconds")
+                )
+            state = repo.pipeline_state(existing_id)
             # Transient embedding failures are eligible for a later ingestion retry.
-            if not state_row or state_row[0] != "EMBEDDING_FAILED":
+            if state != "EMBEDDING_FAILED":
                 continue
             jid = existing_id
         seen_ids.add(jid)
@@ -510,30 +488,7 @@ def main(progress: Any = None) -> None:
     for j in all_jobs:
         st = "DISQUALIFIED" if any(
             f["severity"] == "knockout" for f in (j.get("flags") or [])) else "待投"
-        con.execute("""INSERT INTO jobs
-            (id,title,company,location,description,url,source,source_id,salary,created,
-             sim,llm_score,llm_reason,first_seen,summary,flags,
-             pipeline_state,score_attempts,last_error,updated_at,
-             applied,status,applied_date,note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET
-              title=excluded.title, company=excluded.company, location=excluded.location,
-              description=excluded.description, url=excluded.url, source=excluded.source,
-              source_id=excluded.source_id, salary=excluded.salary, created=excluded.created,
-              sim=excluded.sim, llm_score=excluded.llm_score,
-              llm_reason=excluded.llm_reason, summary=excluded.summary, flags=excluded.flags,
-              pipeline_state=excluded.pipeline_state,
-              score_attempts=jobs.score_attempts + excluded.score_attempts,
-              last_error=excluded.last_error, updated_at=excluded.updated_at,
-              status=CASE WHEN excluded.status='DISQUALIFIED'
-                          THEN 'DISQUALIFIED' ELSE jobs.status END""",
-            (j["id"], j["title"], j["company"], j["location"], j["description"],
-             j["url"], j["source"], j.get("source_id", ""), j["salary"], j["created"],
-             j["sim"], j["llm_score"], j["llm_reason"], now,
-             j.get("summary", ""),
-             json.dumps(j.get("flags", []), ensure_ascii=False),
-             j.get("pipeline_state", "INGESTED"), j.get("score_attempts", 0),
-             j.get("last_error", ""), now, 0, st, "", ""))
+        repo.upsert(j, now, st)
     con.commit()
     con.close()
     write_digest(new_jobs)

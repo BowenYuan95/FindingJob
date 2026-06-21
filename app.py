@@ -21,8 +21,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from config import DB_PATH, LMSTUDIO_BASE
-from infrastructure.database import connect_db, database_session, initialize_database
+from config import DB_PATH
+from infrastructure.database import database_session, initialize_database
+from infrastructure.job_repository import JobRepository
+from infrastructure.lmstudio import LM_CLIENT
+from pipeline.job_urls import normalize_job_url
 
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
 
@@ -37,7 +40,7 @@ st.set_page_config(page_title="求职匹配 + 申请追踪", page_icon="🎯", l
 def load_jobs() -> pd.DataFrame:
     try:
         con = initialize_database(DB_PATH)
-        df = pd.read_sql_query("SELECT * FROM jobs", con)
+        df = pd.DataFrame.from_records(JobRepository(con).fetch_all())
         con.close()
     except Exception as e:
         st.error(f"读取 {DB_PATH} 失败:{e}。先跑一次 pipeline/job_matcher.py。")
@@ -62,9 +65,8 @@ def purge_expired_deadlines() -> int:
     from pipeline.hard_filter import dedup_flags, scan_disqualifiers
     try:
         with database_session(DB_PATH) as con:
-            rows = con.execute(
-                "SELECT id, title, description, flags FROM jobs WHERE status='待投'"
-            ).fetchall()
+            repo = JobRepository(con)
+            rows = repo.pending_deadline_candidates()
             updated = 0
             for jid, title, desc, flags_json in rows:
                 rescanned = scan_disqualifiers(title or "", desc or "")
@@ -76,15 +78,11 @@ def purge_expired_deadlines() -> int:
                 except (TypeError, json.JSONDecodeError):
                     old_flags = []
                 flags = dedup_flags(old_flags + [dl])
-                con.execute(
-                    """UPDATE jobs
-                       SET status='DISQUALIFIED', llm_score=5,
-                           llm_reason=?, flags=?, pipeline_state='DISQUALIFIED',
-                           updated_at=?
-                       WHERE id=?""",
-                    (f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
-                     json.dumps(flags, ensure_ascii=False),
-                     dt.datetime.now().isoformat(timespec="seconds"), jid),
+                repo.mark_deadline_disqualified(
+                    jid,
+                    f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
+                    json.dumps(flags, ensure_ascii=False),
+                    dt.datetime.now().isoformat(timespec="seconds"),
                 )
                 updated += 1
         return updated
@@ -98,11 +96,8 @@ def update_job(job_id: str, **fields: object) -> None:
     if not fields:
         return
     try:
-        con = connect_db(DB_PATH)
-        sets = ", ".join(f"{k}=?" for k in fields)
-        con.execute(f"UPDATE jobs SET {sets} WHERE id=?",
-                    (*fields.values(), job_id))
-        con.commit(); con.close()
+        with database_session(DB_PATH) as con:
+            JobRepository(con).update_user_fields(job_id, fields)
         st.cache_data.clear()
     except Exception as e:
         st.error(f"更新失败:{e}")
@@ -114,14 +109,9 @@ def set_status(job_id: str, status: str) -> None:
     applied_date = ""
     if status != "待投":
         try:
-            con = connect_db(DB_PATH)
-            try:
-                row = con.execute(
-                    "SELECT applied_date FROM jobs WHERE id=?", (job_id,)
-                ).fetchone()
-            finally:
-                con.close()
-            applied_date = (row[0] if row and row[0] else today)
+            with database_session(DB_PATH) as con:
+                previous = JobRepository(con).applied_date(job_id)
+            applied_date = previous or today
         except Exception:
             applied_date = today
     update_job(job_id, status=status,
@@ -130,9 +120,8 @@ def set_status(job_id: str, status: str) -> None:
 
 
 def lmstudio_alive() -> bool:
-    import requests
     try:
-        requests.get(f"{LMSTUDIO_BASE}/models", timeout=3).raise_for_status()
+        LM_CLIENT.loaded_models(timeout=3)
         return True
     except Exception:
         return False
@@ -168,10 +157,9 @@ def trigger_backfill():
 
 def last_update_time() -> str:
     try:
-        con = connect_db(DB_PATH)
-        row = con.execute("SELECT MAX(first_seen) FROM jobs").fetchone()
-        con.close()
-        return row[0] if row and row[0] else "—"
+        with database_session(DB_PATH) as con:
+            value = JobRepository(con).last_seen()
+        return value or "—"
     except Exception:
         return "—"
 
@@ -179,17 +167,8 @@ def last_update_time() -> str:
 def backfill_status() -> tuple[int, int]:
     """Returns (unscored_count, total_pending) — live query, no cache."""
     try:
-        con = connect_db(DB_PATH)
-        unscored = con.execute(
-            """SELECT COUNT(*) FROM jobs
-               WHERE llm_score IS NULL AND status='待投'
-                 AND pipeline_state='READY_FOR_LLM'"""
-        ).fetchone()[0]
-        total = con.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status='待投'"
-        ).fetchone()[0]
-        con.close()
-        return unscored, total
+        with database_session(DB_PATH) as con:
+            return JobRepository(con).pending_counts()
     except Exception:
         return 0, 0
 
@@ -320,9 +299,13 @@ def render_todo() -> None:
                 st.markdown(f"> {r['llm_reason']}")
 
             bcol = st.columns([0.35, 0.4, 0.25])
-            if isinstance(r["url"], str) and r["url"].strip():
+            job_url = normalize_job_url(r.get("url"))
+            if job_url:
                 if bcol[0].button("🔗 查看职位", key=f"url_{r['id']}"):
-                    webbrowser.open(r["url"])
+                    if not webbrowser.open_new_tab(job_url):
+                        bcol[0].warning("浏览器未能打开链接")
+            elif isinstance(r.get("url"), str) and r["url"].strip():
+                bcol[0].caption("⚠ 无效链接")
             # 状态选择(选了非待投即进追踪表)
             new_status = bcol[1].selectbox(
                 "状态", STATUSES, index=0, key=f"st_{r['id']}", label_visibility="collapsed")
@@ -374,9 +357,13 @@ def render_tracker() -> None:
                               if x and str(x).strip())
             date = f" · 📅 {r['applied_date']}" if r["applied_date"] else ""
             st.caption(meta + date)
-            if isinstance(r["url"], str) and r["url"].strip():
+            job_url = normalize_job_url(r.get("url"))
+            if job_url:
                 if st.button("🔗 查看职位", key=f"url_{r['id']}"):
-                    webbrowser.open(r["url"])
+                    if not webbrowser.open_new_tab(job_url):
+                        st.warning("浏览器未能打开链接")
+            elif isinstance(r.get("url"), str) and r["url"].strip():
+                st.caption("⚠ 无效职位链接")
 
             edit = st.columns([0.3, 0.7])
             cur_idx = STATUSES.index(r["status"]) if r["status"] in STATUSES else 0

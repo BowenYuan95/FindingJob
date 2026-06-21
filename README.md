@@ -92,7 +92,9 @@ FindingJob/
 │   ├── hard_filter.py          # 确定性硬性淘汰层（regex，无 LLM 依赖）
 │   └── backfill_scores.py      # 后台 LLM 补评守护进程
 ├── infrastructure/
-│   └── database.py             # SQLite 连接策略、WAL、迁移与索引
+│   ├── database.py             # SQLite 连接策略、WAL、迁移与索引
+│   ├── job_repository.py       # 职位持久化、评分队列与结果写回
+│   └── lmstudio.py             # LM Studio HTTP、超时与统一重试
 │
 ├── sources/                    # 数据来源采集
 │   ├── adzuna_search.py        # Adzuna API 搜索 + 原生职位 ID 去重

@@ -19,16 +19,15 @@ import re
 import json
 import base64
 import logging
-import time
 from html.parser import HTMLParser
 
-import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from config import LMSTUDIO_BASE, LLM_MODEL
+from config import LLM_MODEL
+from infrastructure.lmstudio import LM_CLIENT
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +113,15 @@ def _extract_json_array(txt):
     return "[]"
 
 def _denoise(body):
-    """砍掉页脚噪音 + 压缩超长 URL(token 杀手),让职位信号更集中。"""
-    # 1) 把超长 URL(>80 字符,如 Indeed 加密跳转)压成短占位,省大量 token
-    body = re.sub(r"https?://\S{80,}", "[URL]", body)
+    """砍掉页脚噪音,并用可逆占位符压缩超长 URL。"""
+    url_map = {}
+
+    def replace_url(match):
+        token = f"[URL_{len(url_map) + 1}]"
+        url_map[token] = match.group(0)
+        return token
+
+    body = re.sub(r"https?://\S{80,}", replace_url, body)
     # 2) 砍掉页脚/退订/推荐区块
     cuts = [
         "unsubscribe", "Unsubscribe", "退订", "manage your alerts",
@@ -129,11 +134,22 @@ def _denoise(body):
         idx = body.find(c)
         if idx != -1:
             cut_at = min(cut_at, idx)
-    return body[:cut_at].strip() or body
+    return body[:cut_at].strip() or body, url_map
 
 
-def _llm_extract(body, src, _attempt=1):
+def _restore_url(value, url_map):
+    raw = str(value or "").strip()
+    if raw in url_map:
+        return url_map[raw]
+    match = re.fullmatch(r"\[*URL_(\d+)\]*", raw, flags=re.I)
+    if match:
+        return url_map.get(f"[URL_{match.group(1)}]", "")
+    return raw
+
+
+def _llm_extract(body, src):
     """把一封邮件正文交给 Qwen3.5,抽出职位数组。失败返回 None(触发降级)。"""
+    denoised, url_map = _denoise(body)
     prompt = f"""Extract ALL job listings from this {src} alert email.
 Output ONLY a JSON array. Your FIRST character must be '['. No thinking, no preamble, no explanation.
 Each item: {{"title":"", "company":"", "location":"", "url":"", "desc":""}}
@@ -142,24 +158,25 @@ key skills if shown). If nothing available, use "".
 Skip footers/ads/unsubscribe. If none, output [].
 
 EMAIL:
-{_denoise(body)[:BODY_MAXLEN]}
+{denoised[:BODY_MAXLEN]}
 
 JSON array:"""
     try:
-        r = requests.post(f"{LMSTUDIO_BASE}/chat/completions",
-                          json={"model": LLM_MODEL,
-                                "messages": [
-                                    {"role": "system", "content": "You are a JSON extractor. Output only a JSON array starting with [. Never explain or think."},
-                                    {"role": "user", "content": prompt}],
-                                "temperature": 0.1, "stream": False,
-                                "max_tokens": 8000},
-                          timeout=240)
-        r.raise_for_status()
-        msg_obj = r.json()["choices"][0]["message"]
+        response = LM_CLIENT.chat_completion(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a JSON extractor. Output only a JSON array starting with [. Never explain or think."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            timeout=240,
+            max_tokens=8000,
+        )
+        msg_obj = response["choices"][0]["message"]
         txt = msg_obj.get("content") or ""
         if not txt.strip():                       # content 空则尝试 reasoning 字段
             txt = msg_obj.get("reasoning_content") or msg_obj.get("reasoning") or ""
-        finish = r.json()["choices"][0].get("finish_reason", "")
+        finish = response["choices"][0].get("finish_reason", "")
         if finish == "length":
             logger.warning(f"[gmail]     ⚠ 输出被截断(finish_reason=length)")
         # 调试:打印原始返回的开头,看模型到底在写什么
@@ -176,17 +193,13 @@ JSON array:"""
                 "title": title,
                 "company": (it.get("company") or "").strip(),
                 "location": (it.get("location") or "").strip(),
-                "url": (it.get("url") or "").strip(),
+                "url": _restore_url(it.get("url"), url_map),
                 "description": (it.get("desc") or "").strip(),
                 "source": src, "salary": "", "created": "",
             })
         return out
     except Exception as e:
-        logger.warning(f"[gmail]   LLM 抽取第 {_attempt}/3 次失败({src}): {e}")
-        if _attempt < 3:
-            time.sleep(2 ** (_attempt - 1))
-            return _llm_extract(body, src, _attempt + 1)
-        logger.warning(f"[gmail]   LLM 连续失败({src}),退回正则")
+        logger.warning(f"[gmail]   LLM 抽取失败({src}),退回正则: {e}")
         return None
 
 def _regex_extract(body, src):

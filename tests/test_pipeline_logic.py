@@ -10,7 +10,10 @@ import numpy as np
 from pipeline import backfill_scores, job_matcher
 from scripts.refresh_flags import plan_row
 from sources import adzuna_search
+from sources.gmail_alerts import _denoise, _restore_url
 from infrastructure.database import initialize_database
+from infrastructure.lmstudio import LMStudioClient
+from pipeline.job_urls import normalize_job_url
 
 
 class FakeResponse:
@@ -25,6 +28,21 @@ class FakeResponse:
 
 
 class PipelineLogicTests(unittest.TestCase):
+    def test_gmail_long_url_placeholder_is_reversible(self):
+        url = "https://example.test/redirect?token=" + "a" * 120
+        body, url_map = _denoise(f"Researcher at Example {url}")
+        self.assertNotIn(url, body)
+        token = next(iter(url_map))
+        self.assertEqual(_restore_url(token, url_map), url)
+        self.assertEqual(_restore_url("[URL_1]", url_map), url)
+
+    def test_job_url_validation_rejects_placeholders(self):
+        self.assertIsNone(normalize_job_url("[URL]"))
+        self.assertEqual(
+            normalize_job_url("www.example.com/job"),
+            "https://www.example.com/job",
+        )
+
     @patch("sources.adzuna_search._get_with_retry")
     def test_adzuna_deduplicates_native_job_ids(self, get):
         duplicate = {
@@ -128,20 +146,21 @@ class PipelineLogicTests(unittest.TestCase):
             self.assertEqual(mode.lower(), "wal")
             self.assertIn("idx_jobs_source_identity", indexes)
 
-    @patch("pipeline.job_matcher.time.sleep")
-    @patch("pipeline.job_matcher.requests.post")
+    @patch("infrastructure.lmstudio.time.sleep")
+    @patch("infrastructure.lmstudio.requests.post")
     def test_embedding_retries_transient_failure(self, post, _sleep):
         post.side_effect = [
             OSError("temporary model failure"),
             FakeResponse({"data": [{"embedding": [1.0, 2.0]}]}),
         ]
-        vectors = job_matcher.embed_batch(["text"])
-        np.testing.assert_array_equal(vectors[0], np.array([1.0, 2.0], dtype=np.float32))
+        client = LMStudioClient("http://test/v1")
+        vectors = client.embeddings(["text"], "embed-model")
+        np.testing.assert_array_equal(vectors[0], np.array([1.0, 2.0]))
         self.assertEqual(post.call_count, 2)
 
     @patch("pipeline.job_matcher.time.sleep")
-    @patch("pipeline.job_matcher.requests.post")
-    def test_llm_review_retries_and_maps_discipline_in_python(self, post, _sleep):
+    @patch.object(job_matcher.LM_CLIENT, "chat_completion")
+    def test_llm_review_retries_and_maps_discipline_in_python(self, chat, _sleep):
         content = json.dumps({
             "score": 90,
             "reason": "test",
@@ -153,17 +172,17 @@ class PipelineLogicTests(unittest.TestCase):
                 "discipline_reason": "test",
             },
         }, ensure_ascii=False)
-        post.side_effect = [
+        chat.side_effect = [
             OSError("temporary model failure"),
-            FakeResponse({
+            {
                 "choices": [{"message": {"content": content}}],
-            }),
+            },
         ]
 
         score, _, _, flags = job_matcher.llm_review("profile", {"title": "role"})
 
         self.assertEqual(score, 45)
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(chat.call_count, 2)
         self.assertEqual(flags[-1]["label"], "学科:out_of_domain×0.5")
 
     def test_backfill_knockout_updates_status(self):

@@ -26,10 +26,10 @@ import datetime as dt
 import logging
 import socket
 
-import requests
-
-from config import DB_PATH, PROFILE, LMSTUDIO_BASE, LLM_MODEL
+from config import DB_PATH, PROFILE, LLM_MODEL
 from infrastructure.database import database_session, initialize_database
+from infrastructure.job_repository import JobRepository
+from infrastructure.lmstudio import LM_CLIENT
 from .job_matcher import llm_review, llm_flags_to_objs
 from .hard_filter import apply_flags, dedup_flags
 
@@ -54,9 +54,7 @@ def unload_models() -> None:
 def ensure_llm_loaded() -> bool:
     """LM Studio 在线但模型已卸载时,自动加载评分模型。"""
     try:
-        response = requests.get(f"{LMSTUDIO_BASE}/models", timeout=5)
-        response.raise_for_status()
-        loaded = {item.get("id") for item in response.json().get("data", [])}
+        loaded = LM_CLIENT.loaded_models(timeout=5)
         if LLM_MODEL in loaded:
             return True
     except Exception as e:
@@ -83,21 +81,7 @@ def fetch_unscored(
     """取还没 LLM 分的职位(embedding 已过阈值、在库里),按 embedding 分优先。
     带上 flags 列:backfill 也要复用入库时 hard_filter 存的正则 flags 来封顶。
     注:knockout 岗入库时 llm_score 已被设为 5(非 NULL),故不会被这里捞出重评。"""
-    exclude_ids = exclude_ids or set()
-    excluded_sql = ""
-    params: list[object] = []
-    if exclude_ids:
-        excluded_sql = f" AND id NOT IN ({','.join('?' for _ in exclude_ids)})"
-        params.extend(sorted(exclude_ids))
-    params.append(limit)
-    rows = con.execute(f"""
-        SELECT id, title, company, location, description, flags
-        FROM jobs
-        WHERE llm_score IS NULL AND status='待投'
-          AND pipeline_state='READY_FOR_LLM'{excluded_sql}
-        ORDER BY sim DESC
-        LIMIT ?""", params).fetchall()
-    return rows
+    return JobRepository(con).fetch_scoring_queue(limit, exclude_ids)
 
 
 def score_one(con: sqlite3.Connection, row: tuple) -> bool:
@@ -107,13 +91,10 @@ def score_one(con: sqlite3.Connection, row: tuple) -> bool:
 
     # 接住四元组(新版 llm_review 多返回 llm_flags)
     score, reason, summary, llm_flags = llm_review(PROFILE, job)
+    repo = JobRepository(con)
+    now = dt.datetime.now().isoformat(timespec="seconds")
     if score is None:
-        con.execute(
-            """UPDATE jobs
-               SET score_attempts=score_attempts+1, last_error=?, updated_at=?
-               WHERE id=?""",
-            (reason, dt.datetime.now().isoformat(timespec="seconds"), jid),
-        )
+        repo.record_scoring_failure(jid, reason, now)
         con.commit()
         logger.warning(f"  ✗ {(title or '')[:40]} -> 打分失败,跳过本次")
         return False
@@ -131,15 +112,15 @@ def score_one(con: sqlite3.Connection, row: tuple) -> bool:
             reason = f"[{st}] " + reason
 
     # flags 可能新增了 LLM 自检项,回写库保持一致(apply_flags 内部已去重,这里存合并后的)
-    con.execute(
-        """UPDATE jobs
-           SET llm_score=?, llm_reason=?, summary=?, flags=?,
-               status=CASE WHEN ?='DISQUALIFIED' THEN 'DISQUALIFIED' ELSE status END,
-               pipeline_state=CASE WHEN ?='DISQUALIFIED' THEN 'DISQUALIFIED' ELSE 'SCORED' END,
-               score_attempts=score_attempts+1, last_error='', updated_at=?
-           WHERE id=?""",
-        (score, reason, summary, json.dumps(flags, ensure_ascii=False), st, st,
-         dt.datetime.now().isoformat(timespec="seconds"), jid))
+    repo.record_scoring_success(
+        job_id=jid,
+        score=score,
+        reason=reason,
+        summary=summary,
+        flags=flags,
+        disqualified=(st == "DISQUALIFIED"),
+        now=now,
+    )
     con.commit()           # 逐条提交,面板立即可见
     logger.info(f"  ✓ {(title or '')[:40]} -> {score}")
     return True
@@ -148,11 +129,8 @@ def score_one(con: sqlite3.Connection, row: tuple) -> bool:
 def run_once() -> int:
     con = initialize_database(DB_PATH)
     try:
-        total = con.execute(
-            """SELECT COUNT(*) FROM jobs
-               WHERE llm_score IS NULL AND status='待投'
-                 AND pipeline_state='READY_FOR_LLM'"""
-        ).fetchone()[0]
+        repo = JobRepository(con)
+        total = repo.count_ready_for_scoring()
         if total == 0:
             return 0
         logger.info(f"[backfill] 发现 {total} 条未打分,开始补评… ({dt.datetime.now():%H:%M:%S})")
@@ -207,11 +185,7 @@ def main() -> None:
             if ensure_llm_loaded():
                 run_once()
             with database_session(DB_PATH) as con:
-                remaining = con.execute(
-                    """SELECT COUNT(*) FROM jobs
-                       WHERE llm_score IS NULL AND status='待投'
-                         AND pipeline_state='READY_FOR_LLM'"""
-                ).fetchone()[0]
+                remaining = JobRepository(con).count_ready_for_scoring()
             if remaining:
                 logger.warning(f"[backfill] 本次结束,仍有 {remaining} 条待后续重试。")
             else:

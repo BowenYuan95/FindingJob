@@ -13,7 +13,6 @@ app.py — 求职匹配 + 申请追踪 Streamlit 面板
 
 import os
 import sys
-import json
 import logging
 import webbrowser
 import datetime as dt
@@ -25,6 +24,8 @@ from config import DB_PATH
 from infrastructure.database import database_session
 from infrastructure.job_repository import JobRepository
 from infrastructure.lmstudio import LM_CLIENT
+from pipeline.deadline_cleanup import purge_expired_deadlines as purge_expired_jobs
+from pipeline.hard_filter import find_deadline
 from pipeline.job_urls import normalize_job_url
 
 STATUSES = ["待投", "已投", "面试", "拒", "offer"]
@@ -97,40 +98,19 @@ def render_pagination(state_key: str, page: int, total_pages: int) -> None:
         st.rerun()
 
 
+def render_deadline(job: dict[str, object], target=st) -> None:
+    """Render a detected application deadline directly beneath a job title."""
+    deadline = find_deadline(
+        f"{job.get('title') or ''}\n{job.get('description') or ''}"
+    )
+    if deadline:
+        target.caption(f"📅 截止日期：{deadline.isoformat()}")
+
+
 def purge_expired_deadlines() -> int:
     """重扫待投岗位的截止日期,并同步 status / score / flags。"""
-    from pipeline.hard_filter import dedup_flags, scan_disqualifiers
     try:
-        with database_session(DB_PATH) as con:
-            repo = JobRepository(con)
-            updated = 0
-            after_id = ""
-            while True:
-                rows = repo.pending_deadline_candidates(after_id, limit=100)
-                if not rows:
-                    break
-                for jid, title, desc, flags_json in rows:
-                    rescanned = scan_disqualifiers(title or "", desc or "")
-                    dl = next(
-                        (f for f in rescanned if f["code"] == "deadline_passed"),
-                        None,
-                    )
-                    if not dl:
-                        continue
-                    try:
-                        old_flags = json.loads(flags_json) if flags_json else []
-                    except (TypeError, json.JSONDecodeError):
-                        old_flags = []
-                    flags = dedup_flags(old_flags + [dl])
-                    repo.mark_deadline_disqualified(
-                        jid,
-                        f"硬性淘汰:截止已过 {dl['evidence'][:80]}",
-                        json.dumps(flags, ensure_ascii=False),
-                        dt.datetime.now().isoformat(timespec="seconds"),
-                    )
-                    updated += 1
-                after_id = rows[-1][0]
-        return updated
+        return purge_expired_jobs(DB_PATH)
     except Exception as e:
         st.warning(f"截止日期清理失败:{e}")
         return 0
@@ -394,6 +374,7 @@ def render_todo() -> None:
         with st.container(border=True):
             top = st.columns([0.8, 0.2])
             top[0].markdown(f"### {r['title']}")
+            render_deadline(r, top[0])
             top[1].markdown(f"## `{int(r['score'])}` {tag}")
             meta = " · ".join(str(x) for x in [r["company"], r["location"], r["salary"], r["source"]]
                               if x and str(x).strip())
@@ -478,6 +459,7 @@ def render_tracker() -> None:
         with st.container(border=True):
             head = st.columns([0.6, 0.4])
             head[0].markdown(f"### {r['title']}")
+            render_deadline(r, head[0])
             badge = {"已投": "🟦", "面试": "🟨", "拒": "🟥", "offer": "🟩"}.get(r["status"], "")
             head[1].markdown(f"### {badge} {r['status']}")
             meta = " · ".join(str(x) for x in [r["company"], r["location"], r["source"]]

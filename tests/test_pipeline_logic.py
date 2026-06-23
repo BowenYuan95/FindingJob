@@ -1,4 +1,5 @@
 import json
+import datetime as dt
 import sqlite3
 import sys
 import tempfile
@@ -9,13 +10,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from pipeline import backfill_scores, job_matcher
-from pipeline.hard_filter import apply_flags
+from pipeline.hard_filter import apply_flags, find_deadline
 from scripts.refresh_flags import plan_row
 from sources import adzuna_search
 from sources.gmail_alerts import _denoise, _restore_url
 from infrastructure.database import initialize_database
 from infrastructure.job_repository import JobRepository
 from infrastructure.lmstudio import LMStudioClient
+from pipeline.deadline_cleanup import purge_expired_deadlines
 from pipeline.job_urls import normalize_job_url
 
 
@@ -31,6 +33,18 @@ class FakeResponse:
 
 
 class PipelineLogicTests(unittest.TestCase):
+    def test_find_deadline_returns_closing_date_when_available(self):
+        self.assertEqual(
+            find_deadline(
+                "Applications close 30 July 2026.",
+                dt.date(2026, 6, 24),
+            ),
+            dt.date(2026, 7, 30),
+        )
+        self.assertIsNone(
+            find_deadline("This role starts in July.", dt.date(2026, 6, 24))
+        )
+
     def test_apply_flags_marks_capped_only_when_score_is_reduced(self):
         discipline = [{
             "code": "discipline", "label": "in domain", "cap": 100,
@@ -163,7 +177,38 @@ class PipelineLogicTests(unittest.TestCase):
             self.assertEqual(mode.lower(), "wal")
             self.assertIn("idx_jobs_source_identity", indexes)
             self.assertIn("idx_jobs_todo_score", indexes)
-            self.assertIn("idx_jobs_tracker_date", indexes)
+        self.assertIn("idx_jobs_tracker_date", indexes)
+
+    def test_deadline_cleanup_scans_all_pending_jobs_before_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "jobs.db"
+            con = initialize_database(str(db))
+            con.executemany(
+                """INSERT INTO jobs(id,title,description,status,pipeline_state,flags)
+                   VALUES (?,?,?,?,?,?)""",
+                [
+                    ("expired", "Old role", "Applications close 1 June 2026.",
+                     "待投", "SCORED", "[]"),
+                    ("future", "Open role", "Applications close 30 July 2026.",
+                     "待投", "SCORED", "[]"),
+                    ("applied", "Applied role", "Applications close 1 June 2026.",
+                     "已投", "SCORED", "[]"),
+                ],
+            )
+            con.commit()
+            con.close()
+
+            count = purge_expired_deadlines(str(db), dt.date(2026, 6, 24))
+
+            con = sqlite3.connect(db)
+            try:
+                statuses = dict(con.execute("SELECT id, status FROM jobs").fetchall())
+            finally:
+                con.close()
+            self.assertEqual(count, 1)
+            self.assertEqual(statuses["expired"], "DISQUALIFIED")
+            self.assertEqual(statuses["future"], "待投")
+            self.assertEqual(statuses["applied"], "已投")
 
     def test_todo_pagination_is_stable_and_bounded(self):
         con = initialize_database(":memory:")

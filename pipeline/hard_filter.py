@@ -84,8 +84,9 @@ def _parse_dates_in(window: str, today: dt.date) -> list[dt.date]:
     return out
 
 
-def _find_deadline(text: str, today: dt.date) -> dt.date | None:
+def find_deadline(text: str, today: dt.date | None = None) -> dt.date | None:
     """在 closing 关键词附近 120 字窗口内找日期,返回最早的一个(截止日)。"""
+    today = today or dt.date.today()
     cands = []
     for kw in _CLOSE_KW.finditer(text):
         window = text[kw.start(): kw.start() + 120]
@@ -223,7 +224,7 @@ def scan_disqualifiers(title: str, description: str, today: dt.date | None = Non
         add("registration", "需受监管执业注册(如 AHPRA)", 5, "knockout", _ctx(text, mo))
 
     # 4) 截止日期已过 —— 硬淘汰
-    dl = _find_deadline(text, today)
+    dl = find_deadline(text, today)
     if dl and dl < today:
         add("deadline_passed", f"截止已过({dl.isoformat()})", 5, "knockout",
             f"detected closing date {dl.isoformat()} < today {today.isoformat()}")

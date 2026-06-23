@@ -44,6 +44,7 @@ from config import (
 
 # === [接线 1/3] 顶部导入确定性硬筛层 ===
 from .hard_filter import Flag, scan_disqualifiers, apply_flags, dedup_flags
+from .deadline_cleanup import purge_expired_deadlines
 
 # Gmail 解析模块(OAuth + LLM 抽取),见 sources/gmail_alerts.py
 GMAIL_IMPORT_ERROR: str | None = None
@@ -359,6 +360,10 @@ def main(progress: Any = None) -> None:
         if progress:
             try: progress(frac, msg)
             except Exception: pass
+
+    # Step zero: clean the complete pending-job set before fetching any updates.
+    expired = purge_expired_deadlines(DB_PATH)
+    _p(0.01, f"截止日期清理完成:淘汰 {expired} 条过期职位")
 
     errors, warnings = validate_runtime()
     for warning in warnings:

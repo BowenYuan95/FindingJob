@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ---- Gmail ----
 SCOPES        = ["https://www.googleapis.com/auth/gmail.readonly"]
 LABEL_NAME    = "JobAlerts"     # 与你 Gmail 里的标签名一致(大小写敏感!)
-MAX_DAYS_OLD  = 7
+MAX_DAYS_OLD  = 2
 CREDS_FILE    = "credentials.json"
 TOKEN_FILE    = "token.json"
 
